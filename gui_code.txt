@@ -1,0 +1,282 @@
+# -*- coding: utf-8 -*-
+"""
+gui.py — หน้าต่างโปรแกรมตรวจเอกสารผู้ยื่นข้อเสนอ e-GP
+ใช้งาน: ดับเบิลคลิก gui.bat หรือรัน python gui.py
+"""
+import os
+import sys
+import threading
+import subprocess
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+# ── ชี้ไปที่ project root ────────────────────────────────────────────────────
+ROOT = os.path.dirname(os.path.abspath(__file__))
+PYTHON = sys.executable  # ใช้ Python ตัวที่รัน gui.py นี้
+
+
+# ── สี / ฟอนต์ ───────────────────────────────────────────────────────────────
+BG       = "#F0F4F8"
+ACCENT   = "#2B6CB0"
+ACCENT2  = "#3182CE"
+BTN_FG   = "#FFFFFF"
+LOG_BG   = "#1A202C"
+LOG_FG   = "#A0AEC0"
+LOG_OK   = "#68D391"
+LOG_ERR  = "#FC8181"
+LOG_INFO = "#90CDF4"
+FONT     = ("TH Sarabun New", 14)
+FONT_B   = ("TH Sarabun New", 14, "bold")
+FONT_H   = ("TH Sarabun New", 18, "bold")
+FONT_LOG = ("Consolas", 11)
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("ตรวจเอกสารผู้ยื่นข้อเสนอ e-GP")
+        self.resizable(True, True)
+        self.configure(bg=BG)
+        self.zip_paths: list[str] = []
+        self._build_ui()
+
+        # จัดให้อยู่กลางจอ
+        self.update_idletasks()
+        w, h = 780, 700
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = (sw - w) // 2
+        y = (sh - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+        # บังคับขึ้นมาข้างหน้าเมื่อเปิด
+        self.lift()
+        self.attributes("-topmost", True)
+        self.after(500, lambda: self.attributes("-topmost", False))
+        self.focus_force()
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+    def _build_ui(self):
+        pad = dict(padx=16, pady=6)
+
+        # หัวข้อ
+        tk.Label(self, text="ตรวจเอกสารผู้ยื่นข้อเสนอ e-GP → Excel",
+                 font=FONT_H, bg=BG, fg=ACCENT).pack(pady=(18, 2))
+        tk.Label(self, text="อ่านไฟล์ ZIP จากระบบ e-bidding และสร้าง Excel ตรวจเอกสารส่วนที่ 1 และ 2",
+                 font=FONT, bg=BG, fg="#4A5568").pack(pady=(0, 10))
+
+        ttk.Separator(self).pack(fill="x", padx=16, pady=4)
+
+        # ── ไฟล์ ZIP ──────────────────────────────────────────────────────────
+        frm_zip = tk.LabelFrame(self, text=" ไฟล์ ZIP ผู้ยื่นข้อเสนอ ",
+                                font=FONT_B, bg=BG, fg=ACCENT, bd=2)
+        frm_zip.pack(fill="x", **pad)
+
+        btn_row = tk.Frame(frm_zip, bg=BG)
+        btn_row.pack(fill="x", padx=8, pady=6)
+        self._btn(btn_row, "➕  เพิ่มไฟล์ ZIP", self._add_zips).pack(side="left", padx=(0, 6))
+        self._btn(btn_row, "🗑  ลบที่เลือก", self._remove_zip, style="danger").pack(side="left")
+        self._btn(btn_row, "✖  ล้างทั้งหมด", self._clear_zips, style="danger").pack(side="left", padx=6)
+
+        list_frm = tk.Frame(frm_zip, bg=BG)
+        list_frm.pack(fill="x", padx=8, pady=(0, 8))
+        self.lb_zips = tk.Listbox(list_frm, font=FONT, height=5,
+                                  selectmode="extended",
+                                  bg="white", fg="#2D3748",
+                                  selectbackground=ACCENT2,
+                                  activestyle="none",
+                                  bd=1, relief="solid")
+        sb = ttk.Scrollbar(list_frm, orient="vertical",
+                           command=self.lb_zips.yview)
+        self.lb_zips.configure(yscrollcommand=sb.set)
+        self.lb_zips.pack(side="left", fill="x", expand=True)
+        sb.pack(side="right", fill="y")
+
+        # ── โครงการ / วงเงิน ──────────────────────────────────────────────────
+        frm_info = tk.LabelFrame(self, text=" ข้อมูลโครงการ ",
+                                 font=FONT_B, bg=BG, fg=ACCENT, bd=2)
+        frm_info.pack(fill="x", **pad)
+
+        r1 = tk.Frame(frm_info, bg=BG)
+        r1.pack(fill="x", padx=8, pady=6)
+        tk.Label(r1, text="ชื่อโครงการ :", font=FONT_B, bg=BG, fg="#2D3748",
+                 width=14, anchor="e").pack(side="left")
+        self.ent_project = tk.Entry(r1, font=FONT, bg="white", fg="#2D3748",
+                                    bd=1, relief="solid")
+        self.ent_project.pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+        r2 = tk.Frame(frm_info, bg=BG)
+        r2.pack(fill="x", padx=8, pady=(0, 6))
+        tk.Label(r2, text="วงเงิน (บาท) :", font=FONT_B, bg=BG, fg="#2D3748",
+                 width=14, anchor="e").pack(side="left")
+        self.ent_budget = tk.Entry(r2, font=FONT, bg="white", fg="#2D3748",
+                                   bd=1, relief="solid", width=24)
+        self.ent_budget.pack(side="left", padx=(6, 0))
+
+        # ── Output ────────────────────────────────────────────────────────────
+        frm_out = tk.LabelFrame(self, text=" บันทึกผลที่ ",
+                                font=FONT_B, bg=BG, fg=ACCENT, bd=2)
+        frm_out.pack(fill="x", **pad)
+
+        r3 = tk.Frame(frm_out, bg=BG)
+        r3.pack(fill="x", padx=8, pady=6)
+        self.ent_output = tk.Entry(r3, font=FONT, bg="white", fg="#4A5568",
+                                   bd=1, relief="solid")
+        self.ent_output.insert(0, os.path.join(ROOT, "output", "ตรวจเอกสาร.xlsx"))
+        self.ent_output.pack(side="left", fill="x", expand=True)
+        self._btn(r3, "📂 เลือก", self._pick_output).pack(side="left", padx=(6, 0))
+
+        # ── ปุ่มรัน ───────────────────────────────────────────────────────────
+        ttk.Separator(self).pack(fill="x", padx=16, pady=6)
+        self.btn_run = self._btn(self, "▶  ตรวจเอกสาร", self._run, big=True)
+        self.btn_run.pack(pady=4)
+
+        # ── Log ───────────────────────────────────────────────────────────────
+        log_frm = tk.Frame(self, bg=BG)
+        log_frm.pack(fill="both", expand=True, padx=16, pady=(4, 12))
+        self.log = tk.Text(log_frm, font=FONT_LOG, bg=LOG_BG, fg=LOG_FG,
+                           bd=0, relief="flat", state="disabled",
+                           wrap="word", height=10)
+        sb2 = ttk.Scrollbar(log_frm, orient="vertical", command=self.log.yview)
+        self.log.configure(yscrollcommand=sb2.set)
+        sb2.pack(side="right", fill="y")
+        self.log.pack(side="left", fill="both", expand=True)
+
+        self.log.tag_config("ok",   foreground=LOG_OK)
+        self.log.tag_config("err",  foreground=LOG_ERR)
+        self.log.tag_config("info", foreground=LOG_INFO)
+        self._log("พร้อมใช้งาน — เพิ่มไฟล์ ZIP และกรอกข้อมูลโครงการ แล้วกด ▶ ตรวจเอกสาร", "info")
+
+    def _btn(self, parent, text, cmd, style="normal", big=False):
+        fg = BTN_FG
+        bg = ACCENT if style == "normal" else "#E53E3E"
+        font = ("TH Sarabun New", 16, "bold") if big else FONT
+        b = tk.Button(parent, text=text, font=font,
+                      bg=bg, fg=fg, activebackground=ACCENT2,
+                      activeforeground=BTN_FG,
+                      bd=0, padx=14, pady=6 if not big else 10,
+                      cursor="hand2", command=cmd)
+        return b
+
+    # ── Actions ───────────────────────────────────────────────────────────────
+    def _add_zips(self):
+        files = filedialog.askopenfilenames(
+            title="เลือกไฟล์ ZIP จาก e-GP",
+            filetypes=[("ZIP files", "*.zip"), ("All files", "*.*")],
+            initialdir=os.path.join(ROOT, "uploads") if os.path.exists(
+                os.path.join(ROOT, "uploads")) else ROOT,
+        )
+        for f in files:
+            if f not in self.zip_paths:
+                self.zip_paths.append(f)
+                self.lb_zips.insert("end", os.path.basename(f))
+
+    def _remove_zip(self):
+        sel = list(self.lb_zips.curselection())
+        for i in reversed(sel):
+            self.lb_zips.delete(i)
+            self.zip_paths.pop(i)
+
+    def _clear_zips(self):
+        self.lb_zips.delete(0, "end")
+        self.zip_paths.clear()
+
+    def _pick_output(self):
+        f = filedialog.asksaveasfilename(
+            title="บันทึก Excel ที่",
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx")],
+            initialdir=os.path.join(ROOT, "output"),
+        )
+        if f:
+            self.ent_output.delete(0, "end")
+            self.ent_output.insert(0, f)
+
+    def _log(self, msg: str, tag: str = ""):
+        self.log.configure(state="normal")
+        self.log.insert("end", msg + "\n", tag)
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def _run(self):
+        # ── validate ──────────────────────────────────────────────────────────
+        if not self.zip_paths:
+            messagebox.showerror("ข้อผิดพลาด", "กรุณาเพิ่มไฟล์ ZIP อย่างน้อย 1 ไฟล์")
+            return
+        project = self.ent_project.get().strip()
+        if not project:
+            messagebox.showerror("ข้อผิดพลาด", "กรุณากรอกชื่อโครงการ")
+            return
+        budget_str = self.ent_budget.get().strip().replace(",", "")
+        try:
+            budget = float(budget_str)
+        except ValueError:
+            messagebox.showerror("ข้อผิดพลาด", "วงเงินต้องเป็นตัวเลข เช่น 1391000")
+            return
+        output = self.ent_output.get().strip()
+        if not output:
+            messagebox.showerror("ข้อผิดพลาด", "กรุณาระบุที่บันทึกไฟล์ Excel")
+            return
+
+        self.btn_run.configure(state="disabled", text="⏳  กำลังประมวลผล...")
+        self._log("─" * 60)
+        self._log(f"โครงการ : {project}", "info")
+        self._log(f"วงเงิน  : {budget:,.0f} บาท", "info")
+        self._log(f"ผู้ยื่น  : {len(self.zip_paths)} ราย", "info")
+        self._log("─" * 60)
+
+        # รันใน thread แยก ไม่ให้ UI ค้าง
+        threading.Thread(
+            target=self._run_main,
+            args=(project, budget, output),
+            daemon=True,
+        ).start()
+
+    def _run_main(self, project: str, budget: float, output: str):
+        cmd = [
+            PYTHON,
+            os.path.join(ROOT, "main.py"),
+            *self.zip_paths,
+            "--project", project,
+            "--budget", str(budget),
+            "--output", output,
+        ]
+        try:
+            env = os.environ.copy()
+            env["PYTHONUTF8"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=ROOT,
+                env=env,
+            )
+            for line in proc.stdout:
+                line = line.rstrip()
+                if not line:
+                    continue
+                tag = "ok" if ("✅" in line or "🎉" in line) else \
+                      "err" if ("❌" in line or "Error" in line or "error" in line) else ""
+                self.after(0, self._log, line, tag)
+            proc.wait()
+
+            if proc.returncode == 0:
+                self.after(0, self._log, "✅ เสร็จสิ้น! เปิดไฟล์ Excel...", "ok")
+                self.after(500, lambda: os.startfile(output)
+                           if os.path.exists(output) else None)
+            else:
+                self.after(0, self._log, "❌ เกิดข้อผิดพลาด ดู log ด้านบน", "err")
+        except Exception as e:
+            self.after(0, self._log, f"❌ Exception: {e}", "err")
+        finally:
+            self.after(0, self.btn_run.configure,
+                       {"state": "normal", "text": "▶  ตรวจเอกสาร"})
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()

@@ -1,0 +1,6 @@
+config/api_key.txt
+output/
+*.pyc
+__pycache__/
+*.log
+gui_error.txt

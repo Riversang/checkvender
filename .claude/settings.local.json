@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-PSDrive -PSProvider FileSystem | Select-Object Name, Root, @{N='Used\\(GB\\)';E={[math]::Round\\($_.Used/1GB,1\\)}}, @{N='Free\\(GB\\)';E={[math]::Round\\($_.Free/1GB,1\\)}})",
+      "WebFetch(domain:github.com)",
+      "PowerShell(Invoke-WebRequest -Uri \"https://github.com/winpython/winpython/releases/download/17.4.20260511final/WinPython64-3.13.13.0dot.zip\" -OutFile \"E:\\\\WinPython\\\\WinPython64-3.13.13.0dot.zip\" -UseBasicParsing)"
+    ]
+  }
+}
