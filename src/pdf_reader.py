@@ -169,6 +169,21 @@ def _read_claude_vision(path: str) -> str:
 
 # ─── Public API ───────────────────────────────────────────────────────────────
 
+def read_pdf_tables(path: str) -> list:
+    """อ่านตารางทั้งหมดจาก PDF (ทุกหน้า) ใช้ pdfplumber"""
+    if not _HAS_PDFPLUMBER:
+        return []
+    try:
+        out: list = []
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages:
+                for t in (page.extract_tables() or []):
+                    out.append(t)
+        return out
+    except Exception:
+        return []
+
+
 def read_pdf_text(path: str, use_vision: bool = True) -> tuple[str, bool]:
     """
     อ่าน PDF แบบหลายชั้น คืน (text, used_vision)
@@ -223,23 +238,144 @@ def extract_thai_number(text: str) -> Optional[float]:
     return None
 
 
-def find_shareholder_over(text: str, threshold: float = 25.0) -> list[tuple[str, float]]:
+_TITLES = ("นาย", "นาง", "น.ส.", "นางสาว", "บริษัท", "บจก.", "บมจ.",
+           "หจก.", "ห้างหุ้นส่วน", "Mr.", "Mrs.", "Ms.", "Miss")
+
+
+def _parse_int(s: str) -> Optional[int]:
+    """แปลง '1,127,370' → 1127370"""
+    if not s:
+        return None
+    try:
+        return int(re.sub(r"[,\s]", "", s))
+    except ValueError:
+        return None
+
+
+def _find_total_shares(text: str) -> Optional[int]:
+    """หา 'แบ่งออกเป็น X หุ้น' หรือ ทุนจดทะเบียน / มูลค่าหุ้น"""
+    # แบ่งออกเป็น X หุ้น
+    m = re.search(r"แบ่งออก(?:เป็น)?\s+([\d,]+)\s*หุ้น", text)
+    if m:
+        v = _parse_int(m.group(1))
+        if v:
+            return v
+    # ทุนจดทะเบียน X บาท / มูลค่าหุ้นละ Y บาท → X/Y
+    cap_m = re.search(r"ทุนจดทะเบียน\s+([\d,]+(?:\.\d+)?)\s*บาท", text)
+    val_m = re.search(r"มูลค่าหุ้นละ\s+([\d,]+(?:\.\d+)?)\s*บาท", text)
+    if cap_m and val_m:
+        try:
+            cap = float(cap_m.group(1).replace(",", ""))
+            val = float(val_m.group(1).replace(",", ""))
+            if val > 0:
+                return int(cap / val)
+        except (ValueError, ZeroDivisionError):
+            pass
+    return None
+
+
+def find_shareholder_over(
+    text: str,
+    threshold: float = 25.0,
+    tables: Optional[list] = None,
+) -> list[tuple[str, float]]:
     """
     ค้นหาผู้ถือหุ้นที่ถือ > threshold%
     คืน list of (ชื่อ, %)
-    ใช้กับ text จาก juristic_shareholder sys
+
+    strategy:
+      1. ลองหา % โดยตรงในข้อความ
+      2. ถ้าไม่เจอ → หา total shares + parse จำนวนหุ้นแต่ละราย แล้วคำนวณ %
+      3. ถ้ามี `tables` ส่งมาด้วย (จาก pdfplumber) จะ parse แม่นยิ่งขึ้น
     """
-    results = []
-    lines = text.splitlines()
-    for line in lines:
+    results: list[tuple[str, float]] = []
+
+    # ── strategy 1: หา % ตรงๆ ────────────────────────────────────────────────
+    for line in text.splitlines():
         pct_match = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
         if pct_match:
             pct = float(pct_match.group(1))
             if pct > threshold:
                 name_part = re.sub(r"[\d,\.%]+", "", line).strip()
                 name_part = re.sub(r"\s{2,}", " ", name_part).strip()
-                if name_part:
+                if name_part and any(name_part.startswith(t) for t in _TITLES):
                     results.append((name_part, pct))
+    if results:
+        return results
+
+    # ── strategy 2: คำนวณจาก จำนวนหุ้น / total ────────────────────────────────
+    total = _find_total_shares(text)
+    if not total or total <= 0:
+        return results
+
+    # parse tables ถ้ามี
+    if tables:
+        for tbl in tables:
+            if not tbl:
+                continue
+            # ดู header เป็น "ลำดับที่ | ชื่อผู้ถือหุ้น | ... | จำนวนหุ้นที่ถือ"
+            header = [str(c or "").strip() for c in tbl[0]] if tbl[0] else []
+            name_col = None
+            share_col = None
+            for ci, h in enumerate(header):
+                if "ชื่อ" in h:
+                    name_col = ci
+                if "จำนวนหุ้น" in h or "จํานวนหุ้น" in h:
+                    share_col = ci
+            if name_col is None or share_col is None:
+                continue
+            for row in tbl[1:]:
+                if not row or len(row) <= max(name_col, share_col):
+                    continue
+                name = str(row[name_col] or "").strip()
+                shares = _parse_int(str(row[share_col] or ""))
+                if not name or not shares:
+                    continue
+                pct = shares * 100.0 / total
+                if pct > threshold:
+                    results.append((name, round(pct, 2)))
+        if results:
+            return results
+
+    # parse fallback จาก text (ดู pattern: <ลำดับ> <ชื่อ> ... <หุ้น>)
+    # หา block หลัง "รายชื่อผู้ถือหุ้น"
+    block_start = text.find("รายชื่อผู้ถือหุ้น")
+    block = text[block_start:] if block_start != -1 else text
+    for line in block.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # ตัด ลำดับที่ ออก
+        ln = re.sub(r"^\d+\s+", "", line)
+        # หาจำนวนหุ้นท้ายบรรทัด (เลขล้วน + อาจมี ,)
+        sh_match = re.search(r"([\d,]{4,})\s*$", ln)
+        if not sh_match:
+            continue
+        shares = _parse_int(sh_match.group(1))
+        if not shares or shares <= 0:
+            continue
+        name_chunk = ln[:sh_match.start()].strip()
+        # ตัด อาชีพ, สัญชาติ (heuristic: 2 คำสุดท้ายมักเป็น 'ไทย' หรือชื่อสัญชาติ)
+        # ดึงเฉพาะส่วนที่ขึ้นต้นด้วยคำนำหน้า
+        for t in _TITLES:
+            idx = name_chunk.find(t)
+            if idx != -1:
+                name_chunk = name_chunk[idx:]
+                break
+        # ตัดท้าย: อาชีพ + สัญชาติ (มัก 2-3 คำท้าย)
+        tokens = name_chunk.split()
+        if len(tokens) >= 3:
+            # เอาออก 2 token ท้ายเป็น default (อาชีพ + สัญชาติ)
+            name = " ".join(tokens[:-2])
+        else:
+            name = name_chunk
+        name = name.strip()
+        if not name or not any(name.startswith(t) for t in _TITLES):
+            continue
+        pct = shares * 100.0 / total
+        if pct > threshold:
+            results.append((name, round(pct, 2)))
+
     return results
 
 

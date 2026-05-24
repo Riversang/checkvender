@@ -90,13 +90,14 @@ class App(tk.Tk):
 
         # จัดให้อยู่กลางจอ
         self.update_idletasks()
-        w, h = 900, 840
-        sw = self.winfo_screenwidth()
+        w = 900
         sh = self.winfo_screenheight()
+        h = min(820, sh - 100)  # เว้น ~100px สำหรับ taskbar + title bar
+        sw = self.winfo_screenwidth()
         x = (sw - w) // 2
-        y = max(0, (sh - h) // 2)
+        y = max(20, (sh - h) // 2 - 20)
         self.geometry(f"{w}x{h}+{x}+{y}")
-        self.minsize(780, 700)
+        self.minsize(780, 580)
 
         self.lift()
         self.attributes("-topmost", True)
@@ -251,7 +252,7 @@ class App(tk.Tk):
 
         # ── Header ────────────────────────────────────────────────────────────
         header = tk.Frame(self, bg=BG)
-        header.pack(fill="x", padx=32, pady=(24, 6))
+        header.pack(side="top", fill="x", padx=32, pady=(24, 6))
 
         brand = tk.Frame(header, bg=BG)
         brand.pack(fill="x", anchor="w")
@@ -260,7 +261,6 @@ class App(tk.Tk):
         badge.pack(side="left")
         tk.Label(badge, text="e-GP", font=FONT_BADGE,
                  bg=ACCENT_SOFT, fg=ACCENT).pack()
-        # Pulse the brand badge softly
         self._add_pulse(badge, ACCENT_SOFT, "#C7D2FE", "bg")
 
         tk.Label(brand, text="  •  ตรวจเอกสารส่วนที่ 1 และ 2",
@@ -274,9 +274,79 @@ class App(tk.Tk):
                  font=FONT_SUB, bg=BG, fg=TEXT_MUTED,
                  anchor="w", justify="left").pack(fill="x")
 
-        # ── Content container ────────────────────────────────────────────────
-        content = tk.Frame(self, bg=BG)
-        content.pack(fill="both", expand=True, padx=32, pady=(16, 0))
+        # ── Log panel — pack BOTTOM first so it always shows ─────────────────
+        log_outer = tk.Frame(self, bg=BG)
+        log_outer.pack(side="bottom", fill="x", expand=False,
+                       padx=32, pady=(0, 24))
+
+        log_head = tk.Frame(log_outer, bg=BG)
+        log_head.pack(fill="x", pady=(0, 6))
+        tk.Label(log_head, text="บันทึกการทำงาน",
+                 font=FONT_KICKER, bg=BG, fg=TEXT_MUTED).pack(side="left")
+        self._status_dot = tk.Label(log_head, text="●  พร้อม",
+                                    font=FONT_BADGE, bg=BG, fg=LOG_OK)
+        self._status_dot.pack(side="right")
+
+        log_frm = tk.Frame(log_outer, bg=LOG_BG, bd=0, relief="flat")
+        log_frm.pack(fill="both", expand=False)
+        self.log = tk.Text(log_frm, font=FONT_LOG, bg=LOG_BG, fg=LOG_FG,
+                           bd=0, relief="flat", state="disabled",
+                           wrap="word", height=6,
+                           padx=18, pady=16,
+                           insertbackground=LOG_FG,
+                           highlightthickness=0,
+                           selectbackground="#1E293B",
+                           selectforeground="#FFFFFF")
+        sb2 = ttk.Scrollbar(log_frm, orient="vertical",
+                            style="Dark.Vertical.TScrollbar",
+                            command=self.log.yview)
+        self.log.configure(yscrollcommand=sb2.set)
+        sb2.pack(side="right", fill="y")
+        self.log.pack(side="left", fill="both", expand=True)
+
+        self.log.tag_config("ok",   foreground=LOG_OK)
+        self.log.tag_config("err",  foreground=LOG_ERR)
+        self.log.tag_config("info", foreground=LOG_INFO)
+        self.log.tag_config("dim",  foreground=LOG_DIM)
+        self._log("› พร้อมใช้งาน — เพิ่มไฟล์ ZIP และกรอกข้อมูลโครงการ แล้วกด ▶ ตรวจเอกสาร",
+                  "info")
+
+        # ── Action: Run — pack BOTTOM above log ──────────────────────────────
+        action = tk.Frame(self, bg=BG)
+        action.pack(side="bottom", fill="x", padx=32, pady=(4, 8))
+        self.btn_run = self._btn(action, "▶  ตรวจเอกสาร", self._run,
+                                 style="primary", big=True)
+        self.btn_run.pack(fill="x")
+        self._add_pulse(self.btn_run, NAVY, NAVY_MID, "bg")
+
+        # ── Scrollable content area (cards 01-03) ────────────────────────────
+        scroll_wrap = tk.Frame(self, bg=BG)
+        scroll_wrap.pack(side="top", fill="both", expand=True,
+                         padx=32, pady=(16, 0))
+
+        _canvas = tk.Canvas(scroll_wrap, bg=BG, bd=0, highlightthickness=0)
+        _vsb = ttk.Scrollbar(scroll_wrap, orient="vertical",
+                              command=_canvas.yview,
+                              style="Vertical.TScrollbar")
+        _canvas.configure(yscrollcommand=_vsb.set)
+        _vsb.pack(side="right", fill="y")
+        _canvas.pack(side="left", fill="both", expand=True)
+
+        content = tk.Frame(_canvas, bg=BG)
+        _cwin = _canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def _on_content_resize(e):
+            _canvas.configure(scrollregion=_canvas.bbox("all"))
+        content.bind("<Configure>", _on_content_resize)
+
+        def _on_canvas_resize(e):
+            _canvas.itemconfig(_cwin, width=e.width)
+        _canvas.bind("<Configure>", _on_canvas_resize)
+
+        def _on_mousewheel(e):
+            _canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        _canvas.bind("<MouseWheel>", _on_mousewheel)
+        content.bind("<MouseWheel>", _on_mousewheel)
 
         # ── Card 1: ZIP ─────────────────────────────────────────────────────
         zip_card = self._card(content, "01", "ไฟล์ ZIP ผู้ยื่นข้อเสนอ",
@@ -302,7 +372,7 @@ class App(tk.Tk):
         list_inner = tk.Frame(list_wrap, bg=SURFACE_ALT)
         list_inner.pack(fill="x", padx=1, pady=1)
 
-        self.lb_zips = tk.Listbox(list_inner, font=FONT, height=5,
+        self.lb_zips = tk.Listbox(list_inner, font=FONT, height=4,
                                   selectmode="extended",
                                   bg=SURFACE_ALT, fg=TEXT,
                                   selectbackground=ACCENT,
@@ -316,6 +386,9 @@ class App(tk.Tk):
         self.lb_zips.pack(side="left", fill="x", expand=True,
                           padx=(10, 0), pady=10)
         sb.pack(side="right", fill="y")
+
+        # bind mousewheel on listbox to prevent stealing from canvas
+        self.lb_zips.bind("<MouseWheel>", lambda e: "break")
 
         # ── Card 2: Project ─────────────────────────────────────────────────
         info_card = self._card(content, "02", "ข้อมูลโครงการ",
@@ -358,50 +431,8 @@ class App(tk.Tk):
         self._btn(out_row, "เลือกที่บันทึก", self._pick_output,
                   style="ghost").pack(side="left", padx=(10, 0))
 
-        # ── Action: Run ──────────────────────────────────────────────────────
-        action = tk.Frame(self, bg=BG)
-        action.pack(fill="x", padx=32, pady=(2, 14))
-        self.btn_run = self._btn(action, "▶  ตรวจเอกสาร", self._run,
-                                 style="primary", big=True)
-        self.btn_run.pack(fill="x")
-        # Soft pulse on the run button — gives the breathing/Navi vibe
-        self._add_pulse(self.btn_run, NAVY, NAVY_MID, "bg")
-
-        # ── Log panel ────────────────────────────────────────────────────────
-        log_outer = tk.Frame(self, bg=BG)
-        log_outer.pack(fill="both", expand=True, padx=32, pady=(0, 24))
-
-        log_head = tk.Frame(log_outer, bg=BG)
-        log_head.pack(fill="x", pady=(0, 6))
-        tk.Label(log_head, text="บันทึกการทำงาน",
-                 font=FONT_KICKER, bg=BG, fg=TEXT_MUTED).pack(side="left")
-        self._status_dot = tk.Label(log_head, text="●  พร้อม",
-                                    font=FONT_BADGE, bg=BG, fg=LOG_OK)
-        self._status_dot.pack(side="right")
-
-        log_frm = tk.Frame(log_outer, bg=LOG_BG, bd=0, relief="flat")
-        log_frm.pack(fill="both", expand=True)
-        self.log = tk.Text(log_frm, font=FONT_LOG, bg=LOG_BG, fg=LOG_FG,
-                           bd=0, relief="flat", state="disabled",
-                           wrap="word", height=10,
-                           padx=18, pady=16,
-                           insertbackground=LOG_FG,
-                           highlightthickness=0,
-                           selectbackground="#1E293B",
-                           selectforeground="#FFFFFF")
-        sb2 = ttk.Scrollbar(log_frm, orient="vertical",
-                            style="Dark.Vertical.TScrollbar",
-                            command=self.log.yview)
-        self.log.configure(yscrollcommand=sb2.set)
-        sb2.pack(side="right", fill="y")
-        self.log.pack(side="left", fill="both", expand=True)
-
-        self.log.tag_config("ok",   foreground=LOG_OK)
-        self.log.tag_config("err",  foreground=LOG_ERR)
-        self.log.tag_config("info", foreground=LOG_INFO)
-        self.log.tag_config("dim",  foreground=LOG_DIM)
-        self._log("› พร้อมใช้งาน — เพิ่มไฟล์ ZIP และกรอกข้อมูลโครงการ แล้วกด ▶ ตรวจเอกสาร",
-                  "info")
+        # Ensure canvas scrolls to top after all widgets are rendered
+        self.after(100, lambda: _canvas.yview_moveto(0))
 
     # ── Actions ───────────────────────────────────────────────────────────────
     def _update_zip_count(self):

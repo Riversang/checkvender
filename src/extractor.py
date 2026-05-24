@@ -3,9 +3,12 @@ extractor.py — แตก ZIP และทำ file map ต่อ 1 ผู้ย
 
 ปัญหาที่แก้:
   - ชื่อไฟล์ภาษาไทยยาวเกิน 255 bytes → rename เป็น file_NNN.pdf
-  - ฟัง submitList.pdf เพื่อสร้าง mapping ชื่อเดิม → ชื่อใหม่
+  - เก็บ original name + subfolder path
+  - หา submitList.pdf เพื่อใช้เป็น source of truth
+  - ดึง tax_id ทั้งจากชื่อ ZIP และจากชื่อไฟล์ภายใน (สำหรับชื่อ ZIP ไม่มีตัวเลข)
 """
 import os
+import re
 import zipfile
 from dataclasses import dataclass, field
 from typing import Optional
@@ -14,10 +17,16 @@ from typing import Optional
 @dataclass
 class VendorFiles:
     """ผลจากการแตก ZIP ของผู้ยื่น 1 ราย"""
-    vendor_id: str                      # v1, v2, ...
-    extract_dir: str                    # path ที่แตกแล้ว
-    original_names: dict = field(default_factory=dict)  # safe_name → original_name
-    tax_id: str = ""                    # ดึงจากชื่อไฟล์ ZIP เช่น 0105564124978
+    vendor_id: str                                  # v1, v2, ...
+    extract_dir: str                                # path ที่แตกแล้ว
+    original_names: dict = field(default_factory=dict)  # safe_name → original_basename
+    full_paths: dict = field(default_factory=dict)  # safe_name → original full path in zip
+    tax_id: str = ""                                # 13-digit เลขนิติบุคคล
+    submitlist_path: Optional[str] = None           # path ของ submitList.pdf (ถ้ามี)
+    source_zip: str = ""                            # path ของ ZIP ต้นทาง
+
+
+_TAX_ID_RE = re.compile(r"(?<!\d)(\d{13})(?!\d)")
 
 
 def _safe_name(index: int, original: str) -> str:
@@ -26,44 +35,64 @@ def _safe_name(index: int, original: str) -> str:
     return f"file_{index:03d}{ext}"
 
 
+def _detect_tax_id(zip_path: str, filenames: list[str]) -> str:
+    """
+    หา tax_id (13 หลัก):
+      1. จากชื่อไฟล์ ZIP
+      2. จากชื่อไฟล์ภายใน ZIP (e.g., 0105539071246_juristic_information.pdf)
+    """
+    # 1. จากชื่อ ZIP
+    basename = os.path.basename(zip_path)
+    m = _TAX_ID_RE.search(basename)
+    if m:
+        return m.group(1)
+
+    # 2. จากชื่อไฟล์ภายใน
+    for fn in filenames:
+        m = _TAX_ID_RE.search(os.path.basename(fn))
+        if m:
+            return m.group(1)
+    return ""
+
+
 def extract_zip(zip_path: str, out_base: str, vendor_id: str) -> VendorFiles:
     """
     แตก ZIP ไฟล์เดียว → VendorFiles
-
-    Parameters
-    ----------
-    zip_path  : path ของไฟล์ .zip
-    out_base  : base directory ที่จะสร้าง subfolder
-    vendor_id : ชื่อ id เช่น "v1"
     """
-    # ดึง tax_id จากชื่อไฟล์ ZIP (format: <bid_id>_<tax_id>.zip)
-    basename = os.path.basename(zip_path)
-    parts = os.path.splitext(basename)[0].split("_")
-    tax_id = parts[-1] if len(parts) >= 2 else ""
-
-    out_dir = os.path.join(out_base, vendor_id, "1")
+    out_dir = os.path.join(out_base, vendor_id)
     os.makedirs(out_dir, exist_ok=True)
 
     original_names: dict[str, str] = {}
+    full_paths: dict[str, str] = {}
+    submitlist_path: Optional[str] = None
 
     with zipfile.ZipFile(zip_path) as z:
-        for i, info in enumerate(z.infolist()):
-            if info.filename.endswith("/"):   # skip directories
-                continue
-            orig = info.filename
-            # ใช้ basename เท่านั้น (ตัด subfolder ออก)
-            orig_base = os.path.basename(orig)
+        infos = [i for i in z.infolist() if not i.filename.endswith("/")]
+        # ใช้ชื่อทุกไฟล์ในการหา tax_id
+        tax_id = _detect_tax_id(zip_path, [i.filename for i in infos])
+
+        for i, info in enumerate(infos):
+            orig_full = info.filename
+            orig_base = os.path.basename(orig_full)
             safe = _safe_name(i, orig_base)
             target = os.path.join(out_dir, safe)
             with z.open(info) as src, open(target, "wb") as dst:
                 dst.write(src.read())
             original_names[safe] = orig_base
+            full_paths[safe] = orig_full
+
+            # submitList detection (basename match)
+            if orig_base.lower() == "submitlist.pdf":
+                submitlist_path = target
 
     return VendorFiles(
         vendor_id=vendor_id,
         extract_dir=out_dir,
         original_names=original_names,
+        full_paths=full_paths,
         tax_id=tax_id,
+        submitlist_path=submitlist_path,
+        source_zip=zip_path,
     )
 
 
@@ -99,5 +128,21 @@ def find_files(vf: VendorFiles, keyword: str) -> list[str]:
 
 
 def list_files(vf: VendorFiles) -> list[tuple[str, str]]:
-    """คืน list of (safe_name, original_name)"""
+    """คืน list of (safe_name, original_basename)"""
     return sorted(vf.original_names.items())
+
+
+def find_by_original(vf: VendorFiles, original_name: str) -> Optional[str]:
+    """
+    หา file path จากชื่อ original (basename) ที่ระบุใน submitList
+    รองรับ fuzzy match (เผื่อชื่อใน submitList ตัด space ผิด)
+    """
+    target = re.sub(r"\s+", "", original_name).lower()
+    for safe, orig in vf.original_names.items():
+        if re.sub(r"\s+", "", orig).lower() == target:
+            return os.path.join(vf.extract_dir, safe)
+    # fallback: substring match
+    for safe, orig in vf.original_names.items():
+        if target in re.sub(r"\s+", "", orig).lower():
+            return os.path.join(vf.extract_dir, safe)
+    return None

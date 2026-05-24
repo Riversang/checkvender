@@ -1,12 +1,15 @@
 """
-analyzer.py — วิเคราะห์เอกสารของผู้ยื่น 1 ราย (precision parsing)
+analyzer.py — วิเคราะห์เอกสารของผู้ยื่น 1 ราย
 
-รับ VendorFiles → คืน VendorData ที่มีข้อมูลครบสำหรับสร้าง Excel
+ใช้ submitList.pdf เป็น source of truth สำหรับการตรวจ ✓/-
+(ไม่เดาจากชื่อไฟล์เป็นหลัก เพราะ false positive ง่าย)
 
-ปรับปรุงจากเวอร์ชันก่อนหน้า:
-  - ใช้หลาย regex pattern สำหรับชื่อบริษัท / กรรมการ / ราคา
-  - ดึงราคาจาก Quotation แม่นกว่าเดิม (มอง context "ราคาที่เสนอ", "รวมเป็นเงิน", etc.)
-  - แยกแยะ "หนังสือรับรองผลงาน" กับ "Certificate LINE" จาก content ไม่ใช่แค่ชื่อไฟล์
+content extraction ยังคงใช้ regex/pattern parsing สำหรับ:
+  - ชื่อบริษัท / กรรมการ
+  - ผู้ถือหุ้นรายใหญ่ (>25%) — คำนวณจากจำนวนหุ้น
+  - ผู้มีอำนาจควบคุม
+  - มูลค่าสุทธิ
+  - ราคาเสนอ
 """
 from __future__ import annotations
 import os
@@ -14,12 +17,20 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .extractor import VendorFiles, find_file, find_files, list_files
+from .extractor import VendorFiles, find_file, find_files, list_files, find_by_original
 from .pdf_reader import (
     read_pdf_text,
+    read_pdf_tables,
     extract_net_worth,
     find_shareholder_over,
     extract_thai_number,
+)
+from .submitlist_parser import (
+    parse_submitlist,
+    has_doc as sl_has_doc,
+    get_files as sl_get_files,
+    SubmitList,
+    NO_DOC,
 )
 
 
@@ -35,16 +46,14 @@ class VendorData:
     tax_id: str = ""
     price: float = 0.0
 
-    # กรรมการ
     directors: list[str] = field(default_factory=list)
     authority: str = "-"
     shareholders: str = "-"
 
-    # มูลค่าสุทธิ
     net_worth: float = 0.0
     net_worth_sign: str = "ไม่ทราบ"
 
-    # เอกสารส่วนที่ 1
+    # ส่วนที่ 1
     cert: str = DASH
     memo: str = DASH
     director_list: str = DASH
@@ -57,7 +66,7 @@ class VendorData:
     integrity: str = DASH
     anti_corrupt: str = DASH
 
-    # เอกสารส่วนที่ 2
+    # ส่วนที่ 2
     poa: str = DASH
     guarantee: str = DASH
     sme: str = DASH
@@ -71,88 +80,80 @@ class VendorData:
     _notes: list[str] = field(default_factory=list)
 
 
-# ─── helper ───────────────────────────────────────────────────────────────────
-
-def _has(vf: VendorFiles, *keywords: str) -> bool:
-    """True ถ้าพบไฟล์ที่ original name มี keyword ใดๆ"""
-    for kw in keywords:
-        if find_file(vf, kw):
-            return True
-    return False
-
+# ─── helpers ──────────────────────────────────────────────────────────────────
 
 def _read(path: Optional[str]) -> str:
-    """อ่าน PDF คืน text หรือ '' ถ้าไม่มี/อ่านไม่ได้"""
-    if not path:
+    if not path or not os.path.exists(path):
         return ""
-    text, _ = read_pdf_text(path)
+    text, _ = read_pdf_text(path, use_vision=False)
     return text
 
 
-def _read_first(vf: VendorFiles, *keywords: str) -> str:
-    """หาไฟล์แรกที่ match แล้วอ่าน"""
-    for kw in keywords:
-        p = find_file(vf, kw)
-        if p:
-            return _read(p)
-    return ""
+def _read_tables(path: Optional[str]) -> list:
+    if not path or not os.path.exists(path):
+        return []
+    return read_pdf_tables(path)
 
 
-# ─── keywords ที่ใช้ match ────────────────────────────────────────────────────
-
-KW_CERT      = ["juristic_information", "หนังสือรับรอง"]
-KW_MEMO      = ["juristic_document", "juristic_Objective", "MEMIMG", "บริคณห์"]
-KW_DIRECTOR  = ["juristic_information"]
-KW_AUTHORITY = ["ผู้มีอำนาจควบคุม", "OBJMGR"]
-KW_SHAREHOLDER = ["shareholder", "ผู้ถือหุ้น"]
-KW_TRADE_REG = ["พค", "ทะเบียนพาณิชย์", "ใบสำคัญ", "กรมการค้าธุรกิจ", "พาณิชย์"]
-KW_VAT       = ["ภพ20", "ภพ.20", "ภ พ 20"]
-KW_FINANCIAL = ["financial", "งบการเงิน"]
-KW_POA       = ["มอบอำนาจ", "POA"]
-KW_SME       = ["SME_", "SME_0"]
-KW_CATALOGUE = ["แคตตาล็อก", "catalogue", "คุณลักษณะ", "คุณลักษณะเฉพาะ", "obec-line"]
-KW_WORK_CERT = ["หนังสือรับรองผลงาน", "รับรองผลงาน", "รับรองคู่ฉบับ",
-                "หนังสือรับรอง "]
-KW_LINE_LIC  = ["Verified_Agency", "Verified Agency", "B2B_Verified",
-                "รับรองการเป็นเอเจนซี", "รับรอง Line Agency",
-                "Verfied Agency"]
+def _norm(s: str) -> str:
+    """normalize: lower, ตัด space"""
+    return re.sub(r"\s+", "", (s or "").lower())
 
 
-# ─── precision name extraction ────────────────────────────────────────────────
+# ─── company name ────────────────────────────────────────────────────────────
 
 _NAME_PATTERNS = [
     r"ชื่อสถานที่ประกอบการ\s+(.+?)(?:\n|$)",
     r"ชื่อนิติบุคคล\s+(.+?)(?:\n|$)",
+    r"ชื่อสถานประกอบการ\s+(.+?)(?:\n|$)",
     r"ชื่อผู้ประกอบการ\s+(.+?)(?:\n|$)",
     r"ชื่อ\s*\(ภาษาไทย\)\s*[:：]?\s*(บริษัท[^\n]+|ห้างหุ้นส่วน[^\n]+)",
     r"^(บริษัท\s+[^\n]+?\s+จำกัด(?:\s*\(มหาชน\))?)\s*$",
-    r"ข้าพเจ้า\s+(บริษัท[^\s]+(?:\s+\S+){1,6}จำกัด)",
 ]
 
 
 def _extract_company_name(text: str) -> str:
-    """ดึงชื่อบริษัทจาก text หลาย pattern"""
+    if not text:
+        return ""
     for pat in _NAME_PATTERNS:
         for m in re.finditer(pat, text, re.MULTILINE):
             name = m.group(1).strip()
-            # ตัดข้อความรกๆ
             name = re.sub(r"\s+", " ", name)
             name = name.strip(" :-")
-            # validate: ต้องมี "บริษัท" หรือ "ห้างหุ้นส่วน"
+            # ถ้าตามด้วย "ชื่อสถานประกอบการ..." (text ติดมา) ตัด
+            name = re.split(r"ชื่อสถาน|วันที่จดทะเบียน|ประเภท|ที่ตั้ง", name)[0].strip()
             if "บริษัท" in name or "ห้างหุ้นส่วน" in name or "หจก" in name:
-                # ตัดทรงตัวเลขที่อาจติดมา
                 name = re.sub(r"\s+\d{13}.*$", "", name)
                 return name
     return ""
 
 
-# ─── precision director extraction ────────────────────────────────────────────
+def _extract_name_from_zip(zip_path: str) -> str:
+    """fallback: ใช้ชื่อไฟล์ ZIP เช่น 'บริษัท วันม๊อบบี้ จำกัด.zip' → 'บริษัท วันม๊อบบี้ จำกัด'"""
+    if not zip_path:
+        return ""
+    base = os.path.splitext(os.path.basename(zip_path))[0]
+    # ตัด tax_id, bid_id ออก
+    base = re.sub(r"\b\d{10,}\b", "", base).strip(" _-")
+    if "บริษัท" in base or "ห้างหุ้นส่วน" in base or "หจก" in base:
+        return re.sub(r"\s+", " ", base).strip()
+    return ""
+
+
+# ─── directors ───────────────────────────────────────────────────────────────
+
+_DIR_TITLE_RE = re.compile(
+    r"^(นาย|นาง|น\.ส\.|นางสาว|Mr\.?|Mrs\.?|Miss)\s*\S"
+)
+
 
 def _extract_directors(text: str) -> list[str]:
-    """ดึงรายชื่อกรรมการจาก juristic_information text"""
-    # หา block "รายชื่อกรรมการ" → จนถึง "กรรมการซึ่งลงชื่อ" หรือ keyword อื่น
+    """ดึงรายชื่อกรรมการจาก juristic_information"""
+    if not text:
+        return []
+    # block "รายชื่อกรรมการ" → "กรรมการซึ่งลงชื่อ" หรืออื่นๆ
     patterns = [
-        r"รายชื่อกรรมการ\s+([\s\S]+?)(?:กรรมการซึ่งลงชื่อ|ข้อจำกัด|รายชื่อผู้)",
+        r"รายชื่อกรรมการ\s+([\s\S]+?)(?:กรรมการซึ่งลงชื่อ|ข้อจำกัด|รายชื่อผู้|จำนวนกรรมการ\s+\d)",
         r"กรรมการ(?:บริษัท)?\s*[:：]\s*([\s\S]+?)(?:ข้อจำกัด|ลายมือชื่อ|ผู้มีอำนาจ)",
     ]
     for pat in patterns:
@@ -160,32 +161,133 @@ def _extract_directors(text: str) -> list[str]:
         if not m:
             continue
         raw = m.group(1)
-        dirs = []
+        dirs: list[str] = []
         for ln in raw.splitlines():
-            ln = ln.strip()
-            # ตัดตัวเลขลำดับนำหน้า, ตัด หมายเหตุ
+            ln = ln.strip().rstrip("/").strip()
             ln = re.sub(r"^\d+[\.\)]\s*", "", ln)
             ln = re.sub(r"\s+", " ", ln).strip()
             if not ln:
                 continue
-            # ต้องเริ่มด้วยคำนำหน้าชื่อ
-            if re.match(r"^(นาย|นาง|น\.ส\.|นางสาว|Mr\.?|Mrs\.?|Miss)", ln):
-                dirs.append(ln)
-            elif ln and len(ln) < 60 and re.search(r"[฀-๿]", ln):
-                # บรรทัดที่เป็นภาษาไทยสั้นๆ ก็น่าจะใช่
-                dirs.append(ln)
+            if _DIR_TITLE_RE.match(ln):
+                # ตัดข้อความหลังจุด/comma
+                ln = re.split(r"[,/]", ln)[0].strip()
+                # ตัด trailing คำว่า "และ ..." ถ้ามี
+                ln = re.sub(r"\s+และ\s+.*$", "", ln).strip()
+                if ln and ln not in dirs:
+                    dirs.append(ln)
         if dirs:
-            return dirs[:20]  # cap ที่ 20 คน
+            return dirs[:20]
     return []
 
 
-# ─── precision price extraction ───────────────────────────────────────────────
+# ─── authority (ผู้มีอำนาจควบคุม) ────────────────────────────────────────────
+
+# คำที่ขึ้นต้นด้วย "นาย/นาง" แต่ไม่ใช่ชื่อคน
+_NOT_PERSON_WORDS = {
+    "หน้า", "จ้าง", "ทะเบียน", "ทุน", "ห้าง", "ก", "ข", "ค", "ทาน", "เวร",
+    "ภาษี", "การ", "งาน", "เจตน์", "ภูมิ",
+}
+
+
+def _is_real_name(name: str) -> bool:
+    """ตรวจว่า 'นายXXX' เป็นชื่อคนจริง (ไม่ใช่คำว่า นายหน้า, นายจ้าง ฯลฯ)"""
+    if not name or len(name) < 5:
+        return False
+    # ต้องมีชื่อ + นามสกุล (อย่างน้อย 2 token)
+    tokens = name.split()
+    if len(tokens) < 2:
+        return False
+    title = tokens[0]
+    first = tokens[1] if len(tokens) > 1 else ""
+    # ตัดคำนำหน้าออก
+    for t in ("นาย", "นาง", "น.ส.", "นางสาว", "Mr.", "Mr", "Mrs.", "Mrs", "Miss"):
+        if title.startswith(t):
+            first_after = title[len(t):]
+            if first_after:
+                first = first_after
+            break
+    # คำหลัง "นาย/นาง" ต้องไม่อยู่ใน stop-list
+    if first in _NOT_PERSON_WORDS:
+        return False
+    # คำต้องเป็นภาษาไทยอย่างน้อย 2 ตัวอักษร
+    if not re.match(r"^[ก-๛]{2,}", first):
+        return False
+    return True
+
+
+def _extract_authority(vf: VendorFiles, info_text: str = "",
+                       sl_authority_files: list[str] = None) -> str:
+    """
+    ดึงรายชื่อผู้มีอำนาจควบคุมจาก:
+      1. กรรมการที่ลงชื่อผูกพันบริษัท (จาก juristic_information)
+      2. ไฟล์ "บัญชีผู้มีอำนาจควบคุม" (ที่ submitList ระบุไว้)
+
+    ไม่อ่าน OBJMGR — เพราะเป็นไฟล์ "วัตถุประสงค์" ไม่ใช่อำนาจ
+    """
+    names: list[str] = []
+
+    def _scan_text_for_names(text: str, into: list[str]):
+        """หาชื่อในข้อความและเติมใส่ list (dedupe)"""
+        for nm in re.finditer(
+            r"((?:นาย|นาง|น\.ส\.|นางสาว|Mr\.?|Mrs\.?)\s*[ก-๛]{2,15}"
+            r"(?:\s+[ก-๛]{2,25}){0,3})",
+            text,
+        ):
+            name = re.sub(r"\s+", " ", nm.group(1)).strip()
+            # ตัด trailing: คำเชื่อม + ข้อความติดมา (รองรับทั้งกรณีมี space และไม่มี)
+            name = re.split(
+                r"\s+(?:และ|หรือ|กับ|พร้อม|ที่|ซึ่ง|ลง|ตา|รับรอง|มี|ใน|รวม|ทั้ง|ขอ|ลายมือ)",
+                name, maxsplit=1,
+            )[0].strip()
+            # ตัด ถ้ามีคำว่า "หรือ"+คำนำหน้าติดกัน (เช่น "หรือนางสาว")
+            name = re.split(r"(?:หรือ|และ)(?:นาย|นาง|น\.ส\.|นางสาว)", name, maxsplit=1)[0].strip()
+            # ตัด suffix เป็นตัวเลข/คำสั้น (เช่น "5", "ก.")
+            name = re.sub(r"\s+[ก-๛]{1}\.?$", "", name).strip()
+            if _is_real_name(name) and name not in into:
+                into.append(name)
+
+    # 1. จาก info_text — "กรรมการซึ่งลงชื่อผูกพัน..."
+    if info_text:
+        m = re.search(
+            r"กรรมการซึ่งลงชื่อผูกพัน(?:บริษัท)?ได้\s+([\s\S]+?)"
+            r"(?:พร้อม|ประทับ|ข้อจำกัด|สำคัญของบริษัท|รายชื่อผู้|\Z)",
+            info_text,
+        )
+        if m:
+            _scan_text_for_names(m.group(1), names)
+
+    # 2. จากไฟล์ที่ submitList ระบุ (authority_doc) — เสริมถ้าเจอเพิ่ม
+    if sl_authority_files:
+        for fname in sl_authority_files:
+            p = find_by_original(vf, fname)
+            if not p:
+                continue
+            t = _read(p)
+            if not t:
+                continue
+            # หา section ผู้มีอำนาจ ในไฟล์
+            # ลอง pattern หลาย รูป
+            block = t
+            section_m = re.search(
+                r"(?:ผู้มีอำนาจ|ลายมือชื่อผู้|กรรมการผู้มีอำนาจ)[\s\S]{0,2000}",
+                t,
+            )
+            if section_m:
+                block = section_m.group(0)
+            _scan_text_for_names(block, names)
+            if len(names) >= 2:
+                break
+
+    if not names:
+        return "-"
+    return "\n".join(f"{i+1}. {n}" for i, n in enumerate(names[:10]))
+
+
+# ─── price extraction ────────────────────────────────────────────────────────
 
 _PRICE_CONTEXT_PATTERNS = [
-    # ราคาที่เสนอใน Quotation มักมาพร้อม keyword พวกนี้
     r"(?:ราคาที่เสนอ|ราคารวม|รวมทั้งสิ้น|รวมเป็นเงิน|ยอดรวม|จำนวนเงินที่เสนอ|เสนอราคาเป็นเงิน)"
     r"[^\d๐-๙]{0,30}([\d,๐-๙]+(?:\.[\d๐-๙]+)?)",
-    # หรือมี "บาท" ตามหลัง
     r"([\d,๐-๙]+(?:\.[\d๐-๙]+)?)\s*บาท",
 ]
 
@@ -193,16 +295,9 @@ THAI_DIGITS = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
 
 
 def _extract_price(text: str, budget: float = 0) -> float:
-    """
-    ดึงราคาเสนอจาก Quotation text
-
-    กลยุทธ์:
-      1. หาตัวเลขที่มี context keyword เช่น "ราคาที่เสนอ", "รวมเป็นเงิน"
-      2. กรองด้วย range ที่สมเหตุสมผล (ใกล้กับ budget ถ้ามี)
-      3. เลือกตัวที่พบมากที่สุด (เพราะราคารวมมักโผล่หลายที่)
-    """
+    if not text:
+        return 0.0
     candidates: dict[float, int] = {}
-
     for pat in _PRICE_CONTEXT_PATTERNS:
         for m in re.finditer(pat, text):
             raw = m.group(1).translate(THAI_DIGITS).replace(",", "")
@@ -210,7 +305,6 @@ def _extract_price(text: str, budget: float = 0) -> float:
                 val = float(raw)
             except ValueError:
                 continue
-            # range filter — ราคาประกวดราคา IT มักอยู่ระหว่าง 1 แสน - 100 ล้าน
             if not (100_000 <= val <= 100_000_000):
                 continue
             candidates[val] = candidates.get(val, 0) + 1
@@ -218,139 +312,243 @@ def _extract_price(text: str, budget: float = 0) -> float:
     if not candidates:
         return 0.0
 
-    # ถ้ามี budget ให้ priority ราคาที่ <= budget * 1.5
     if budget > 0:
-        near_budget = {v: c for v, c in candidates.items() if v <= budget * 1.5}
-        if near_budget:
-            candidates = near_budget
+        near = {v: c for v, c in candidates.items() if v <= budget * 1.5}
+        if near:
+            candidates = near
 
-    # เลือกตัวที่พบบ่อยที่สุด ถ้าเสมอกันให้เลือกค่าที่ใกล้ budget ที่สุด (ถ้ามี budget)
     if budget > 0:
         return max(candidates.items(),
                    key=lambda kv: (kv[1], -abs(kv[0] - budget)))[0]
     return max(candidates.items(), key=lambda kv: kv[1])[0]
 
 
-# ─── content-based document classification ────────────────────────────────────
+# ─── ส่วนที่ 2: identify by filename patterns ───────────────────────────────
 
-def _is_work_cert_content(text: str) -> bool:
-    """ตรวจว่า text เป็นหนังสือรับรองผลงาน (จากเนื้อหา)"""
-    markers = ["รับรองผลงาน", "ขอรับรองว่า", "ได้ดำเนินการ", "งานสำเร็จเรียบร้อย",
-               "ได้ปฏิบัติงาน", "ผู้ว่าจ้าง", "คู่สัญญา"]
-    hits = sum(1 for m in markers if m in text)
-    return hits >= 2
+# pattern เฉพาะของ LINE Corporation cert
+_LINE_PATTERNS = [
+    r"verified[_ ]agency",
+    r"verfied[_ ]agency",     # typo จาก e-GP บางราย
+    r"verified[_ ]partner",
+    r"b2b[_ ]verified",
+    r"line[_ ]agency",
+    r"line[_ ]service",
+    r"line[_ ]official",
+    r"obec[-_ ]line",
+    r"agency[_ ]of[_ ]line",
+    r"รับรอง.*line[_ ]agency",
+    r"รับรอง.*line[_ ]oa",
+    r"เอกสารรับรองการเป็นเอเจนซี",
+    r"รับรองเอเจนซี",
+]
+
+_WORK_CERT_PATTERNS = [
+    r"หนังสือรับรองผลงาน",
+    r"รับรองผลงาน",
+    r"รับรองคู่ฉบับ",
+    r"รับรองสัญญา",
+    r"ใบรับรองผลงาน",
+]
+
+_CATALOGUE_PATTERNS = [
+    r"แคตตาล็อ[กค]",       # รองรับทั้ง 'แคตตาล็อก' และ 'แคตตาล็อค'
+    r"แคตตาลอ[กค]",
+    r"catalogue",
+    r"catalog",
+    r"คุณลักษณะ",
+    r"ข้อเสนอทางเทคนิค",
+    r"comply\s*tor",
+    r"^qt\d",
+    r"obec[-_ ]?line",     # LINE OA spec sheet (มักรวม catalogue)
+    r"line[_ ]oa.*spec",
+    r"google[_ ]slides",   # vendor บางรายส่ง slide เป็น catalogue
+]
+
+_SME_PATTERNS = [
+    r"^sme[_\- ]",
+    r"sme_\d{10,}",
+    r"วิสาหกิจขนาดกลาง",
+]
+
+_MIT_PATTERNS = [
+    r"made\s*in\s*thailand",
+    r"\bmit\b",
+    r"^mit[_\- ]",
+]
+
+_POA_PATTERNS = [
+    r"มอบอำนาจ",
+    r"^poa[-_ ]",
+    r"power\s*of\s*attorney",
+]
 
 
-def _is_line_license_content(text: str) -> bool:
-    """ตรวจว่า text เป็น Certificate LINE (จากเนื้อหา)"""
-    markers = ["LINE", "Official Account", "Verified Agency", "B2B Partner",
-               "Certified", "Authorized", "Agency", "Partner"]
-    hits = sum(1 for m in markers if m in text)
-    return hits >= 2
+def _any_match(text: str, patterns: list[str]) -> bool:
+    if not text:
+        return False
+    low = text.lower()
+    for p in patterns:
+        if re.search(p, low, re.IGNORECASE):
+            return True
+    return False
 
 
-# ─── main analyzer ────────────────────────────────────────────────────────────
+def _has_in_files(file_list: list[str], patterns: list[str]) -> bool:
+    """True ถ้ามีไฟล์ใน list ใดๆ ที่ชื่อ match pattern"""
+    for f in file_list:
+        if _any_match(f, patterns):
+            return True
+    return False
+
+
+def _collect_part2_candidates(sl: SubmitList, vf: VendorFiles) -> list[str]:
+    """รวม filename จาก submitList ส่วนที่ 2 + ไฟล์จริงใน ZIP ที่ไม่อยู่ในส่วนที่ 1"""
+    part1_files: set[str] = set()
+    for entry in sl.part1.values():
+        for f in entry.files:
+            part1_files.add(_norm(f))
+
+    candidates = list(sl.part2_files)
+    # บวก ไฟล์ใน ZIP ที่ไม่ใช่ submitList และไม่อยู่ใน part1
+    for safe, orig in vf.original_names.items():
+        if orig.lower() == "submitlist.pdf":
+            continue
+        if _norm(orig) in part1_files:
+            continue
+        if orig not in candidates:
+            candidates.append(orig)
+    return candidates
+
+
+# ─── main analyzer ───────────────────────────────────────────────────────────
 
 def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> VendorData:
-    """
-    วิเคราะห์เอกสารจาก VendorFiles และคืน VendorData
-
-    Parameters
-    ----------
-    vf         : VendorFiles ที่แตก ZIP แล้ว
-    vendor_no  : ลำดับผู้ยื่น (1, 2, 3, ...)
-    budget     : วงเงินงบประมาณ — ใช้ priority ราคาที่ใกล้เคียง
-    """
     d = VendorData(no=vendor_no, tax_id=vf.tax_id)
 
-    # ── 1. ชื่อบริษัท / กรรมการ ─────────────────────────────────────────────
-    info_text = _read_first(vf, *KW_CERT)
+    # ── 0. parse submitList ─────────────────────────────────────────────────
+    sl = parse_submitlist(vf.submitlist_path) if vf.submitlist_path else SubmitList()
+
+    # ── 1. ชื่อบริษัท / กรรมการ / authority ─────────────────────────────────
+    info_text = ""
+    # ลองอ่านจากไฟล์ที่ submitList ระบุก่อน (แม่นที่สุด)
+    for fname in sl_get_files(sl, "cert"):
+        p = find_by_original(vf, fname)
+        if p:
+            info_text = _read(p)
+            if info_text and "บริษัท" in info_text:
+                break
+
+    # fallback: หา juristic_information แบบ keyword
+    if not info_text or "บริษัท" not in info_text:
+        p = find_file(vf, "juristic_information")
+        if p:
+            info_text = _read(p)
+
     if info_text:
         d.name = _extract_company_name(info_text)
         d.directors = _extract_directors(info_text)
 
-    # fallback ชื่อบริษัท: ลองจาก Quotation
+    # fallback ชื่อบริษัท
     if not d.name:
-        q_text = _read(find_file(vf, "Quotation"))
-        if q_text:
-            d.name = _extract_company_name(q_text)
-
-    # fallback ชื่อบริษัท: ลองจากไฟล์อื่น
+        q = find_file(vf, "Quotation")
+        if q:
+            d.name = _extract_company_name(_read(q))
     if not d.name:
         for safe, _orig in list_files(vf):
             p = os.path.join(vf.extract_dir, safe)
             if not p.lower().endswith(".pdf"):
                 continue
-            t = _read(p)
-            n = _extract_company_name(t)
+            n = _extract_company_name(_read(p))
             if n:
                 d.name = n
                 break
+    if not d.name:
+        d.name = _extract_name_from_zip(vf.source_zip)
 
-    # ── 2. ผู้ถือหุ้นรายใหญ่ ─────────────────────────────────────────────────
-    sh_text = _read_first(vf, *KW_SHAREHOLDER)
-    if sh_text:
-        holders = find_shareholder_over(sh_text, threshold=25.0)
+    # authority
+    d.authority = _extract_authority(
+        vf, info_text,
+        sl_authority_files=sl_get_files(sl, "authority_doc"),
+    )
+
+    # ── 2. ผู้ถือหุ้น >25% ──────────────────────────────────────────────────
+    sh_path = None
+    for fname in sl_get_files(sl, "shareholder_doc"):
+        p = find_by_original(vf, fname)
+        if p:
+            sh_path = p
+            break
+    if not sh_path:
+        sh_path = find_file(vf, "shareholder")
+
+    if sh_path:
+        sh_text = _read(sh_path)
+        sh_tables = _read_tables(sh_path)
+        holders = find_shareholder_over(sh_text, threshold=25.0, tables=sh_tables)
         if holders:
             d.shareholders = "\n".join(f"{n} ({p:.2f}%)" for n, p in holders)
 
-    # ── 3. มูลค่าสุทธิ ───────────────────────────────────────────────────────
-    fin_text = _read_first(vf, *KW_FINANCIAL)
-    if fin_text:
-        val, sign = extract_net_worth(fin_text)
+    # ── 3. มูลค่าสุทธิ ──────────────────────────────────────────────────────
+    fin_path = None
+    for fname in sl_get_files(sl, "financial"):
+        p = find_by_original(vf, fname)
+        if p:
+            fin_path = p
+            break
+    if not fin_path:
+        fin_path = find_file(vf, "financial") or find_file(vf, "งบการเงิน")
+
+    if fin_path:
+        val, sign = extract_net_worth(_read(fin_path))
         if val is not None:
             d.net_worth = val
             d.net_worth_sign = sign
 
-    # ── 4. ราคา จาก Quotation (precision parsing) ────────────────────────────
-    q_text = _read(find_file(vf, "Quotation"))
-    if q_text:
-        d.price = _extract_price(q_text, budget=budget)
+    # ── 4. ราคาเสนอ ─────────────────────────────────────────────────────────
+    q_path = find_file(vf, "Quotation")
+    if q_path:
+        d.price = _extract_price(_read(q_path), budget=budget)
 
-    # ── 5. ส่วนที่ 1: ตรวจการมีไฟล์ ─────────────────────────────────────────
-    d.cert            = CHECK if _has(vf, *KW_CERT)         else DASH
-    d.memo            = CHECK if _has(vf, *KW_MEMO)         else DASH
-    d.director_list   = CHECK if _has(vf, *KW_DIRECTOR)     else DASH
-    d.authority_doc   = CHECK if _has(vf, *KW_AUTHORITY)    else DASH
-    d.shareholder_doc = CHECK if _has(vf, *KW_SHAREHOLDER)  else DASH
-    d.trade_reg       = CHECK if _has(vf, *KW_TRADE_REG)    else DASH
-    d.vat             = CHECK if _has(vf, *KW_VAT)          else DASH
+    # ── 5. ส่วนที่ 1: ใช้ submitList ────────────────────────────────────────
+    if sl.parsed_ok:
+        d.cert            = CHECK if sl_has_doc(sl, "cert")            else DASH
+        d.memo            = CHECK if sl_has_doc(sl, "memo")            else DASH
+        d.director_list   = CHECK if sl_has_doc(sl, "director_list")   else DASH
+        d.shareholder_doc = CHECK if sl_has_doc(sl, "shareholder_doc") else DASH
+        d.authority_doc   = CHECK if sl_has_doc(sl, "authority_doc")   else DASH
+        d.credit          = CHECK if sl_has_doc(sl, "credit")          else DASH
+        d.trade_reg       = CHECK if sl_has_doc(sl, "trade_reg")       else DASH
+        d.vat             = CHECK if sl_has_doc(sl, "vat")             else DASH
+    else:
+        # fallback: เดาจากไฟล์
+        d.cert            = CHECK if find_file(vf, "juristic_information") else DASH
+        d.memo            = CHECK if (find_file(vf, "juristic_document")
+                                       or find_file(vf, "MEMIMG")
+                                       or find_file(vf, "บริคณห์")) else DASH
+        d.director_list   = d.cert
+        d.shareholder_doc = CHECK if find_file(vf, "shareholder") else DASH
+        d.authority_doc   = CHECK if (find_file(vf, "ผู้มีอำนาจควบคุม")
+                                       or find_file(vf, "OBJMGR")) else DASH
+        d.trade_reg       = CHECK if (find_file(vf, "ทะเบียนพาณิชย์")
+                                       or find_file(vf, "ใบสำคัญ")) else DASH
+        d.vat             = CHECK if (find_file(vf, "ภพ20") or find_file(vf, "ภพ.20")
+                                       or find_file(vf, "ภ.พ.20")
+                                       or find_file(vf, "ภ พ 20")) else DASH
 
-    # ── 6. ส่วนที่ 2 ─────────────────────────────────────────────────────────
-    d.poa           = CHECK if _has(vf, *KW_POA)        else DASH
-    d.sme           = CHECK if _has(vf, *KW_SME)        else DASH
-    d.catalogue     = CHECK if _has(vf, *KW_CATALOGUE)  else DASH
-    d.work_cert     = CHECK if _has(vf, *KW_WORK_CERT)  else DASH
-    d.line_license  = CHECK if _has(vf, *KW_LINE_LIC)   else DASH
+    # ── 6. ส่วนที่ 2: filename pattern matching ─────────────────────────────
+    candidates = _collect_part2_candidates(sl, vf)
 
-    # ── 6.5 content-based classification (เผื่อชื่อไฟล์ไม่ตรง) ─────────────
-    if d.work_cert == DASH or d.line_license == DASH:
-        for safe, _orig in list_files(vf):
-            p = os.path.join(vf.extract_dir, safe)
-            if not p.lower().endswith(".pdf"):
-                continue
-            t = _read(p)
-            if not t:
-                continue
-            if d.work_cert == DASH and _is_work_cert_content(t):
-                d.work_cert = CHECK
-            if d.line_license == DASH and _is_line_license_content(t):
-                d.line_license = CHECK
-            if d.work_cert == CHECK and d.line_license == CHECK:
-                break
-
-    # ── 7. ผู้มีอำนาจควบคุม (text) ───────────────────────────────────────────
-    auth_text = _read_first(vf, *KW_AUTHORITY)
-    if auth_text:
-        names = re.findall(r"((?:นาย|นาง|น\.ส\.|นางสาว)[^\n\t\d]{2,30})", auth_text)
-        if names:
-            d.authority = "\n".join(f"{i+1}. {n.strip()}" for i, n in enumerate(names[:5]))
+    d.catalogue    = CHECK if _has_in_files(candidates, _CATALOGUE_PATTERNS) else DASH
+    d.line_license = CHECK if _has_in_files(candidates, _LINE_PATTERNS)      else DASH
+    d.sme          = CHECK if _has_in_files(candidates, _SME_PATTERNS)       else DASH
+    d.mit          = CHECK if _has_in_files(candidates, _MIT_PATTERNS)       else DASH
+    d.work_cert    = CHECK if _has_in_files(candidates, _WORK_CERT_PATTERNS) else DASH
+    d.poa          = CHECK if _has_in_files(candidates, _POA_PATTERNS)       else DASH
 
     return d
 
 
 def analyze_all(vendor_files: list[VendorFiles], budget: float = 0) -> list[VendorData]:
-    """วิเคราะห์ทุกรายคืน list[VendorData]"""
     results = []
     for i, vf in enumerate(vendor_files):
         print(f"  Analyzing {vf.vendor_id} (tax: {vf.tax_id})...")
