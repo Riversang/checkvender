@@ -103,12 +103,23 @@ def _norm(s: str) -> str:
 # ─── company name ────────────────────────────────────────────────────────────
 
 _NAME_PATTERNS = [
-    r"ชื่อสถานที่ประกอบการ\s+(.+?)(?:\n|$)",
-    r"ชื่อนิติบุคคล\s+(.+?)(?:\n|$)",
-    r"ชื่อสถานประกอบการ\s+(.+?)(?:\n|$)",
-    r"ชื่อผู้ประกอบการ\s+(.+?)(?:\n|$)",
+    # juristic_information: "ชื่อสถานที่ประกอบการ บริษัท X จำกัด"
+    r"ชื่อสถานที่ประกอบการ\s+(บริษัท[^\n]+?(?:จำกัด|มหาชน)(?:\s*\(มหาชน\))?)",
+    r"ชื่อนิติบุคคล\s+(บริษัท[^\n]+?(?:จำกัด|มหาชน)(?:\s*\(มหาชน\))?)",
+    r"ชื่อสถานประกอบการ\s+(บริษัท[^\n]+?(?:จำกัด|มหาชน)(?:\s*\(มหาชน\))?)",
+    r"ชื่อผู้ประกอบการ\s+(บริษัท[^\n]+?(?:จำกัด|มหาชน)(?:\s*\(มหาชน\))?)",
+    # หนังสือรับรองบริษัท: "1. ชื่อบริษัท บริษัท X จำกัด"
+    r"ชื่อบริษัท\s+(บริษัท[^\n]+?(?:จำกัด|มหาชน)(?:\s*\(มหาชน\))?)",
+    # Quotation: "ข้าพเจ้า บริษัท X จำกัด"
+    r"ข้าพเจ้า\s+(บริษัท[^\n]+?(?:จำกัด|มหาชน)(?:\s*\(มหาชน\))?)",
+    # shareholder/financial: "ชื่อ บริษัท X จำกัด"
+    r"ชื่อ\s+(บริษัท[^\n]+?(?:จำกัด|มหาชน)(?:\s*\(มหาชน\))?)",
+    # ภาษาไทย header
     r"ชื่อ\s*\(ภาษาไทย\)\s*[:：]?\s*(บริษัท[^\n]+|ห้างหุ้นส่วน[^\n]+)",
+    # full line standalone
     r"^(บริษัท\s+[^\n]+?\s+จำกัด(?:\s*\(มหาชน\))?)\s*$",
+    # ห้างหุ้นส่วน
+    r"(ห้างหุ้นส่วน[จำกัด|สามัญ][^\n]+)",
 ]
 
 
@@ -325,21 +336,34 @@ def _extract_price(text: str, budget: float = 0) -> float:
 
 # ─── ส่วนที่ 2: identify by filename patterns ───────────────────────────────
 
-# pattern เฉพาะของ LINE Corporation cert
+# pattern เฉพาะของ LINE Corporation cert — ต้องเป็นเอกสารรับรอง "ตัวแทน/agency"
+# ไม่ใช่แค่ไฟล์ที่มีคำว่า "LINE" (เช่น สเปคโครงการ "LINE Official Account")
 _LINE_PATTERNS = [
     r"verified[_ ]agency",
-    r"verfied[_ ]agency",     # typo จาก e-GP บางราย
+    r"verfied[_ ]agency",      # typo
     r"verified[_ ]partner",
     r"b2b[_ ]verified",
     r"line[_ ]agency",
-    r"line[_ ]service",
-    r"line[_ ]official",
-    r"obec[-_ ]line",
     r"agency[_ ]of[_ ]line",
-    r"รับรอง.*line[_ ]agency",
-    r"รับรอง.*line[_ ]oa",
+    r"agency[_ ]of[_ ]line[_ ]service",
     r"เอกสารรับรองการเป็นเอเจนซี",
     r"รับรองเอเจนซี",
+    r"รับรอง.*line[_ ]agency",
+    r"หนังสือรับรอง.*line",
+]
+
+# ถ้า filename match patterns เหล่านี้ → ไม่นับเป็น LINE cert (เป็น catalogue/spec)
+_LINE_NEGATIVE_PATTERNS = [
+    r"คุณลักษณะ",          # รายละเอียดคุณลักษณะเฉพาะ
+    r"แคตตาล็อ[กค]",
+    r"catalogue",
+    r"catalog",
+    r"\bspec(ification)?\b",
+    r"ข้อเสนอทางเทคนิค",
+    r"google[_ ]slides",
+    r"comply[_ ]tor",
+    r"^qt\d",              # Quotation auto-named files
+    r"obec[-_ ]line",      # OBEC spec files
 ]
 
 _WORK_CERT_PATTERNS = [
@@ -393,11 +417,19 @@ def _any_match(text: str, patterns: list[str]) -> bool:
     return False
 
 
-def _has_in_files(file_list: list[str], patterns: list[str]) -> bool:
-    """True ถ้ามีไฟล์ใน list ใดๆ ที่ชื่อ match pattern"""
+def _has_in_files(file_list: list[str], patterns: list[str],
+                  negative_patterns: list[str] = None) -> bool:
+    """
+    True ถ้ามีไฟล์ใดๆ ที่:
+      - ชื่อ match `patterns` (positive)
+      - และไม่ match `negative_patterns` (ใช้กรอง false positives)
+    """
     for f in file_list:
-        if _any_match(f, patterns):
-            return True
+        if not _any_match(f, patterns):
+            continue
+        if negative_patterns and _any_match(f, negative_patterns):
+            continue   # skip — เป็น catalogue/spec ไม่ใช่ cert
+        return True
     return False
 
 
@@ -434,12 +466,12 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
     for fname in sl_get_files(sl, "cert"):
         p = find_by_original(vf, fname)
         if p:
-            info_text = _read(p)
-            if info_text and "บริษัท" in info_text:
-                break
+            t = _read(p)
+            if t and len(t) > len(info_text):
+                info_text = t  # เก็บ text ยาวสุดไว้
 
     # fallback: หา juristic_information แบบ keyword
-    if not info_text or "บริษัท" not in info_text:
+    if not info_text:
         p = find_file(vf, "juristic_information")
         if p:
             info_text = _read(p)
@@ -448,11 +480,37 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
         d.name = _extract_company_name(info_text)
         d.directors = _extract_directors(info_text)
 
-    # fallback ชื่อบริษัท
-    if not d.name:
-        q = find_file(vf, "Quotation")
-        if q:
-            d.name = _extract_company_name(_read(q))
+    # fallback ชื่อบริษัท — ลองหลายแหล่งตามลำดับความน่าเชื่อถือ
+    fallback_sources: list[tuple[str, str]] = []
+    # 1. Quotation (มี "ข้าพเจ้า บริษัท X" ชัดเจน)
+    q = find_file(vf, "Quotation")
+    if q:
+        fallback_sources.append(("Quotation", _read(q)))
+    # 2. shareholder file (มี "ชื่อ บริษัท X")
+    for fname in sl_get_files(sl, "shareholder_doc"):
+        p = find_by_original(vf, fname)
+        if p:
+            fallback_sources.append(("shareholder", _read(p)))
+            break
+    if not any(s == "shareholder" for s, _ in fallback_sources):
+        p = find_file(vf, "shareholder")
+        if p:
+            fallback_sources.append(("shareholder", _read(p)))
+    # 3. director_list file
+    for fname in sl_get_files(sl, "director_list"):
+        p = find_by_original(vf, fname)
+        if p:
+            fallback_sources.append(("director_list", _read(p)))
+            break
+
+    for _src, txt in fallback_sources:
+        if d.name:
+            break
+        n = _extract_company_name(txt)
+        if n:
+            d.name = n
+
+    # 4. ลองทุก PDF ที่เหลือ
     if not d.name:
         for safe, _orig in list_files(vf):
             p = os.path.join(vf.extract_dir, safe)
@@ -462,6 +520,8 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
             if n:
                 d.name = n
                 break
+
+    # 5. fallback สุดท้าย: ชื่อ ZIP file
     if not d.name:
         d.name = _extract_name_from_zip(vf.source_zip)
 
@@ -539,7 +599,8 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
     candidates = _collect_part2_candidates(sl, vf)
 
     d.catalogue    = CHECK if _has_in_files(candidates, _CATALOGUE_PATTERNS) else DASH
-    d.line_license = CHECK if _has_in_files(candidates, _LINE_PATTERNS)      else DASH
+    d.line_license = CHECK if _has_in_files(candidates, _LINE_PATTERNS,
+                                             _LINE_NEGATIVE_PATTERNS)         else DASH
     d.sme          = CHECK if _has_in_files(candidates, _SME_PATTERNS)       else DASH
     d.mit          = CHECK if _has_in_files(candidates, _MIT_PATTERNS)       else DASH
     d.work_cert    = CHECK if _has_in_files(candidates, _WORK_CERT_PATTERNS) else DASH
