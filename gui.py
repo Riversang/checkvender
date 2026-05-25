@@ -16,39 +16,47 @@ from tkinter import ttk, filedialog, messagebox
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
-def _find_python() -> str:
+def _find_winpython() -> str:
     """
-    หา python.exe ที่มี dependencies ครบ (openpyxl ฯลฯ)
+    หา WinPython บน drive เดียวกับ project (portable — ใช้ตัวเดียวเสมอ)
 
-    ลำดับ:
-      1. WinPython บน drive เดียวกับ project (portable, มี packages พร้อม)
-      2. sys.executable (Python ที่รัน gui.py อยู่)
+    ไม่ fallback ไป system Python — เพื่อให้พกพา HDD/USB ไปเครื่องอื่นได้
+    โดยไม่ขึ้นกับ Python ที่ติดตั้งบนเครื่องนั้น
 
-    ป้องกันกรณีที่เครื่องมี Python หลายตัว แล้ว gui.py โดน launch จาก
-    Python ที่ไม่ได้ install dependencies
+    Returns
+    -------
+    path ของ python.exe ใน WinPython หรือ "" ถ้าไม่เจอ
     """
     drive = os.path.splitdrive(ROOT)[0]
-    if drive:
-        # ลองหา WinPython บน drive เดียวกัน
-        candidates = glob.glob(
-            os.path.join(drive + os.sep, "WinPython", "**", "python.exe"),
-            recursive=True,
-        )
-        # เช็คว่าตัวไหนมี openpyxl
-        for p in candidates:
-            try:
-                r = subprocess.run(
-                    [p, "-c", "import openpyxl"],
-                    capture_output=True, timeout=5,
-                )
-                if r.returncode == 0:
-                    return p
-            except (subprocess.TimeoutExpired, OSError):
-                continue
-    return sys.executable
+    if not drive:
+        return ""
+    candidates = glob.glob(
+        os.path.join(drive + os.sep, "WinPython", "**", "python.exe"),
+        recursive=True,
+    )
+    # ตัว python.exe (ไม่ใช่ pythonw.exe หรือไฟล์อื่น)
+    candidates = [p for p in candidates
+                  if os.path.basename(p).lower() == "python.exe"]
+    if not candidates:
+        return ""
+    # ถ้ามีหลายตัว เลือกตัวที่ path ตื้นที่สุด (มัก stable กว่า)
+    candidates.sort(key=lambda p: len(p))
+    return candidates[0]
 
 
-PYTHON = _find_python()
+PYTHON = _find_winpython()
+if not PYTHON:
+    # แสดง dialog แจ้ง user แล้วออก
+    import tkinter.messagebox as _mb
+    _root = tk.Tk()
+    _root.withdraw()
+    _mb.showerror(
+        "ไม่พบ WinPython",
+        f"ไม่พบโฟลเดอร์ WinPython บน drive {os.path.splitdrive(ROOT)[0]}\\\n\n"
+        "โปรเจคนี้ใช้ WinPython แบบ portable\n"
+        "กรุณาตรวจสอบว่ามีโฟลเดอร์ <drive>\\WinPython\\ อยู่",
+    )
+    sys.exit(1)
 
 # ── สี / ฟอนต์ (Soft Navy palette) ──────────────────────────────────────────
 BG          = "#EEF2F7"   # soft blue-gray canvas
