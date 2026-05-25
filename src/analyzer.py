@@ -169,9 +169,11 @@ def _extract_name_from_zip(zip_path: str) -> str:
 
 # ─── directors ───────────────────────────────────────────────────────────────
 
-_DIR_TITLE_RE = re.compile(
-    r"^(นาย|นาง|น\.ส\.|นางสาว|Mr\.?|Mrs\.?|Miss)\s*\S"
-)
+# Title prefix — รองรับ "น.." กรณี font subset (ตัว "ส" หาย)
+# เช่น "น..มนต์ธีตา" จริงๆ คือ "น.ส.มนต์ธีตา"
+_TITLE_ALT = r"(?:นาย|นาง|น\.ส?\.?|นางสาว|Mr\.?|Mrs\.?|Miss)"
+
+_DIR_TITLE_RE = re.compile(r"^" + _TITLE_ALT + r"\s*\S")
 
 
 def _extract_directors(text: str) -> list[str]:
@@ -212,8 +214,7 @@ def _extract_directors(text: str) -> list[str]:
     # รองรับ multi-column layout (เช่น "1. นายA B 2. นายC D" ในบรรทัดเดียว)
     dirs2: list[str] = []
     for m2 in re.finditer(
-        r"\d+[\.\)]\s+((?:นาย|นาง|น\.ส\.|นางสาว|Mr\.?|Mrs\.?)"
-        r"\s*\S+\s+\S+)",
+        r"\d+[\.\)]\s+(" + _TITLE_ALT + r"\s*\S+\s+\S+)",
         text,
     ):
         name = re.sub(r"\s+", " ", m2.group(1)).strip()
@@ -255,7 +256,9 @@ def _is_real_name(name: str) -> bool:
     title = tokens[0]
     first = tokens[1] if len(tokens) > 1 else ""
     # ตัดคำนำหน้าออก (กรณีติดกับชื่อ "นายX")
-    for t in ("นาย", "นาง", "น.ส.", "นางสาว", "Mr.", "Mr", "Mrs.", "Mrs", "Miss"):
+    # รองรับ "น.." (ตัว ส หาย จาก font subset) เช่น "น..มนต์ธีตา"
+    for t in ("นางสาว", "น.ส.", "น..", "น.ส", "น.", "นาย", "นาง",
+              "Mr.", "Mr", "Mrs.", "Mrs", "Miss"):
         if title.startswith(t):
             first_after = title[len(t):]
             if first_after:
@@ -327,7 +330,7 @@ def _extract_authority(vf: VendorFiles,
         # ขยาย char limit สูงขึ้น — กรณี OCR รวม first+last เป็นคำเดียว
         # (เช่น "นายธารินทร์จงประเจิด" = 20 chars, "นางชัยลดาตันติเวชกุล" = 20 chars)
         for nm in re.finditer(
-            r"\d+[\.\)]\s+((?:นาย|นาง|น\.ส\.|นางสาว|Mr\.?|Mrs\.?)"
+            r"\d+[\.\)]\s+(" + _TITLE_ALT +
             r"\s*[ก-๛]{2,40}"            # ขยายเป็น 40 รองรับชื่อยาวที่ติดกัน
             r"(?:\s+(?!และ|หรือ|กับ|พร้อม|ลง|ที่|ซึ่ง|รับรอง|รวม|มี|ใน|ทั้ง|ขอ|ลายมือ"
             r"|กรรมการ|ประทับ|ลายมือชื่อ|ตา|คนใด|คนหนึ่ง|สำคัญ)"
@@ -340,7 +343,7 @@ def _extract_authority(vf: VendorFiles,
                 r"\s+(?:และ|หรือ|กับ|พร้อม|ที่|ซึ่ง|ลง|ตา|รับรอง|มี|ใน|รวม|ทั้ง|ขอ|ลายมือ)",
                 name, maxsplit=1,
             )[0].strip()
-            name = re.split(r"(?:หรือ|และ)(?:นาย|นาง|น\.ส\.|นางสาว)", name, maxsplit=1)[0].strip()
+            name = re.split(r"(?:หรือ|และ)" + _TITLE_ALT, name, maxsplit=1)[0].strip()
             name = re.sub(r"\s+[ก-๛]{1}\.?$", "", name).strip()
             # normalize spaces ก่อนเช็ค dup (เผื่อ PDF artifact "นายอภิศักด ิ์")
             norm = re.sub(r"\s+", "", name)
