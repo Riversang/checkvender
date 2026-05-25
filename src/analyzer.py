@@ -273,24 +273,27 @@ def _is_real_name(name: str) -> bool:
 
 def _extract_authority(vf: VendorFiles,
                        sl_authority_files: list[str] = None,
-                       unread: list = None,
-                       directors: list[str] = None) -> str:
+                       unread: list = None) -> str:
     """
     ดึงรายชื่อผู้มีอำนาจควบคุมจากไฟล์ที่ submitList ระบุไว้เท่านั้น
+
+    Concepts (ต้องแยกให้ชัด — ห้ามปน):
+      1. กรรมการ (registered directors)        ← juristic_information
+      2. ผู้มีอำนาจควบคุม (controlling persons) ← submitList row "ผู้มีอำนาจควบคุม"
+      3. ผู้ถือหุ้นรายใหญ่ (major shareholders) ← shareholder file >25%
+      ── "ผู้มีอำนาจลงนาม" (signatory) ไม่เกี่ยวกับระบบนี้ ──
 
     Rule:
       - ใช้เฉพาะไฟล์ใน submitList หมวด "ผู้มีอำนาจควบคุม"
       - ไม่ใช้ "กรรมการซึ่งลงชื่อผูกพัน" (= ผู้มีอำนาจลงนาม คนละหมวด)
+      - ไม่ใช้ directors เป็น fallback (กรรมการ ≠ ผู้มีอำนาจควบคุม)
       - ถ้าไม่มีไฟล์ใน submitList → "-"
-      - ถ้ามีไฟล์ใน submitList แต่อ่านไม่ออก (scanned)
-        + บริษัทมีกรรมการคนเดียว → ใช้คนนั้น (1-director default)
-        + บริษัทมีกรรมการหลายคน → "-" (รอ OCR)
+      - ถ้ามีไฟล์แต่อ่านไม่ออก → "-" (มี warning ในหมายเหตุให้ user OCR เอง)
     """
     if not sl_authority_files:
         return "-"
 
     names: list[str] = []
-    file_was_read = False
     for fname in sl_authority_files:
         p = find_by_original(vf, fname)
         if not p:
@@ -343,11 +346,6 @@ def _extract_authority(vf: VendorFiles,
                 names.append(name)
         if names:
             break  # เจอชื่อแล้ว ไม่ต้องดูไฟล์อื่น
-
-    # fallback: ไฟล์ submitList ระบุไว้ + บริษัทกรรมการคนเดียว → ใช้คนนั้น
-    # (case ไตรยูนิตี้ — authority file scanned แต่ user เอา director = authority)
-    if not names and directors and len(directors) == 1:
-        return f"1. {directors[0]}"
 
     if not names:
         return "-"
@@ -605,11 +603,11 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
         d.name = _extract_name_from_zip(vf.source_zip)
 
     # authority — ใช้เฉพาะไฟล์จาก submitList หมวด "ผู้มีอำนาจควบคุม"
+    # (ไม่ใช้ directors, ไม่ใช้ "กรรมการลงชื่อผูกพัน" — คนละหมวด)
     d.authority = _extract_authority(
         vf,
         sl_authority_files=sl_get_files(sl, "authority_doc"),
         unread=d.unread_files,
-        directors=d.directors,
     )
 
     # ── 2. ผู้ถือหุ้น >25% ──────────────────────────────────────────────────
