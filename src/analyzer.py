@@ -68,12 +68,14 @@ class VendorData:
 
     # ส่วนที่ 2
     poa: str = DASH
-    guarantee: str = DASH
+    guarantee: str = DASH       # หลักประกัน (สำคัญใน MA/งานจ้าง)
     sme: str = DASH
     mit: str = DASH
     catalogue: str = DASH
     work_cert: str = DASH       # หนังสือรับรองผลงาน
     line_license: str = DASH    # Certificate/License (LINE)
+    personnel: str = DASH       # บุคลากรหลัก (สำคัญใน MA)
+    project_mgmt: str = DASH    # แผน/โครงสร้างการบริหารโครงการ (MA)
     other1: str = ""
     other1_note: str = ""
 
@@ -438,12 +440,15 @@ _CATALOGUE_PATTERNS = [
     r"catalogue",
     r"catalog",
     r"คุณลักษณะ",
+    r"คุณสมบัติเฉพาะ",     # MA: "ตารางเปรียบเทียบคุณสมบัติเฉพาะ"
+    r"ตารางเปรียบเทียบ",
     r"ข้อเสนอทางเทคนิค",
     r"comply\s*tor",
     r"^qt\d",
     r"obec[-_ ]?line",     # LINE OA spec sheet (มักรวม catalogue)
     r"line[_ ]oa.*spec",
     r"google[_ ]slides",   # vendor บางรายส่ง slide เป็น catalogue
+    r"spec[_ ]?sheet",
 ]
 
 _SME_PATTERNS = [
@@ -462,6 +467,36 @@ _POA_PATTERNS = [
     r"มอบอำนาจ",
     r"^poa[-_ ]",
     r"power\s*of\s*attorney",
+]
+
+# หลักประกัน (bid guarantee / bank guarantee) — สำคัญใน MA/งานจ้าง
+_GUARANTEE_PATTERNS = [
+    r"หลักประกัน",
+    r"bank[_ ]guarantee",
+    r"bid[_ ]bond",
+    r"performance[_ ]bond",
+]
+
+# บุคลากร (key personnel) — สำคัญใน MA, จ้างที่ปรึกษา
+_PERSONNEL_PATTERNS = [
+    r"บุคลากร",
+    r"^\d*บุคลากร[_ ]",
+    r"resume",
+    r"cv[_ ]",
+    r"key[_ ]personnel",
+    r"ประวัติส่วนตัว",
+    r"ประวัติบุคลากร",
+]
+
+# โครงสร้างบริหารโครงการ / แผนการดำเนินงาน
+_MGMT_PATTERNS = [
+    r"โครงสร้าง.*บริหาร",
+    r"โครงสร้าง.*โครงการ",
+    r"แผน(?:การดำเนินงาน|งาน|ปฏิบัติงาน)",
+    r"project[_ ](?:management|structure|plan)",
+    r"work[_ ]plan",
+    r"วิธีการ(?:ทำงาน|ดำเนินงาน)",
+    r"methodology",
 ]
 
 
@@ -694,6 +729,9 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
     d.mit          = CHECK if _has_in_files(candidates, _MIT_PATTERNS)       else DASH
     d.work_cert    = CHECK if _has_in_files(candidates, _WORK_CERT_PATTERNS) else DASH
     d.poa          = CHECK if _has_in_files(candidates, _POA_PATTERNS)       else DASH
+    d.guarantee    = CHECK if _has_in_files(candidates, _GUARANTEE_PATTERNS) else DASH
+    d.personnel    = CHECK if _has_in_files(candidates, _PERSONNEL_PATTERNS) else DASH
+    d.project_mgmt = CHECK if _has_in_files(candidates, _MGMT_PATTERNS)      else DASH
 
     # dedupe unread files (เก็บลำดับเดิม)
     if d.unread_files:

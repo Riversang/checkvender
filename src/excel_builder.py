@@ -117,11 +117,13 @@ _HEADERS_2 = [
     "หนังสือ\nมอบอำนาจ", "หลักประกัน",
     "SMEs", "Made in\nThailand",
     "แคตตาล็อก/\nคุณลักษณะเฉพาะ",
-    "หนังสือรับรอง\nผลงาน",                         # H — แยกใหม่
-    "หนังสือรับรอง\nCertificate/\nLicense (LINE)",  # I — แยกใหม่
-    "อื่นๆ", "อื่นๆ", "หมายเหตุ",
+    "หนังสือรับรอง\nผลงาน",                         # H
+    "หนังสือรับรอง\nCertificate/\nLicense (LINE)",  # I (e-bidding ซื้อ)
+    "บุคลากร",                                       # J (MA / จ้าง)
+    "แผน/โครงสร้าง\nการบริหาร",                     # K (MA / จ้าง)
+    "หมายเหตุ",
 ]
-_WIDTHS_2 = [6, 28, 10, 10, 8, 10, 16, 14, 18, 10, 10, 22]
+_WIDTHS_2 = [6, 28, 10, 10, 8, 10, 16, 14, 18, 10, 14, 22]
 
 
 def _build_sheet2(wb, vendors: list[VendorData], project_name: str):
@@ -157,8 +159,8 @@ def _build_sheet2(wb, vendors: list[VendorData], project_name: str):
         _sc(ws, row, 7,  v.catalogue,    fill=fill)
         _sc(ws, row, 8,  v.work_cert,    fill=wc_fill)
         _sc(ws, row, 9,  v.line_license, fill=ll_fill)
-        _sc(ws, row, 10, v.other1 or "", fill=fill)
-        _sc(ws, row, 11, "",             fill=fill)
+        _sc(ws, row, 10, v.personnel,    fill=fill)
+        _sc(ws, row, 11, v.project_mgmt, fill=fill)
         # หมายเหตุ: รวม other1_note + warning ไฟล์อ่านไม่ออก
         note_parts = []
         if v.other1_note:
