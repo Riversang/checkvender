@@ -264,96 +264,61 @@ def _is_real_name(name: str) -> bool:
     return True
 
 
-def _extract_authority(vf: VendorFiles, info_text: str = "",
+def _extract_authority(vf: VendorFiles,
                        sl_authority_files: list[str] = None,
-                       directors: list[str] = None,
                        unread: list = None) -> str:
     """
-    ดึงรายชื่อผู้มีอำนาจควบคุมจาก:
-      1. กรรมการที่ลงชื่อผูกพันบริษัท (จาก juristic_information)
-      2. ไฟล์ "บัญชีผู้มีอำนาจควบคุม" (ที่ submitList ระบุไว้)
-      3. ถ้าบริษัทใช้สูตร "กรรมการ X คนลงลายมือชื่อร่วมกัน" → คืน directors ทุกคน
+    ดึงรายชื่อผู้มีอำนาจควบคุมจากไฟล์ที่ submitList ระบุไว้เท่านั้น
 
-    ไม่อ่าน OBJMGR — เพราะเป็นไฟล์ "วัตถุประสงค์" ไม่ใช่อำนาจ
+    Rule (จาก user req):
+      - ใช้เฉพาะไฟล์ใน submitList หมวด "ผู้มีอำนาจควบคุม"
+      - ไม่ใช้ "กรรมการซึ่งลงชื่อผูกพัน" (เป็นผู้มีอำนาจลงนาม ไม่ใช่ผู้มีอำนาจควบคุม)
+      - ไม่ใช้ directors เป็น fallback
+      - ถ้าไม่มีไฟล์ → "-"
     """
-    names: list[str] = []
-    use_all_dirs = False
+    if not sl_authority_files:
+        return "-"
 
-    def _scan_text_for_names(text: str, into: list[str]):
-        """หาชื่อในข้อความและเติมใส่ list (dedupe)"""
-        # negative lookahead: หยุดถ้าคำถัดไปเป็น connector (และ/หรือ/etc)
+    names: list[str] = []
+    for fname in sl_authority_files:
+        p = find_by_original(vf, fname)
+        if not p:
+            continue
+        t = _read(p, unread=unread, label="ผู้มีอำนาจควบคุม")
+        if not t:
+            continue
+        # หา section ผู้มีอำนาจ ในไฟล์
+        block = t
+        section_m = re.search(
+            r"(?:ผู้มีอำนาจ|ลายมือชื่อผู้|กรรมการผู้มีอำนาจ|รายชื่อผู้)[\s\S]{0,3000}",
+            t,
+        )
+        if section_m:
+            block = section_m.group(0)
+        # หา ชื่อในรูป "<n>. หรือ <n>) แล้ว นาย/นาง/น.ส./นางสาว <name>"
+        # บังคับมี numbered prefix เพื่อกัน signature/footer ที่ใส่ชื่อซ้ำ
         for nm in re.finditer(
-            r"((?:นาย|นาง|น\.ส\.|นางสาว|Mr\.?|Mrs\.?)"
-            r"\s*[ก-๛]{2,15}"           # first name
+            r"\d+[\.\)]\s+((?:นาย|นาง|น\.ส\.|นางสาว|Mr\.?|Mrs\.?)"
+            r"\s*[ก-๛]{2,15}"
             r"(?:\s+(?!และ|หรือ|กับ|พร้อม|ลง|ที่|ซึ่ง|รับรอง|รวม|มี|ใน|ทั้ง|ขอ|ลายมือ"
             r"|กรรมการ|ประทับ|ลายมือชื่อ|ตา|คนใด|คนหนึ่ง|สำคัญ)"
-            r"[ก-๛]{2,25}){0,2}"        # last name (+ optional middle), max 2 tokens
+            r"[ก-๛]{1,25}){0,3}"        # ขยายเป็น 3 tokens รองรับ "ณ อยุธยา"
             r")",
-            text,
+            block,
         ):
             name = re.sub(r"\s+", " ", nm.group(1)).strip()
-            # ตัด trailing: คำเชื่อม + ข้อความติดมา (รองรับทั้งกรณีมี space และไม่มี)
             name = re.split(
                 r"\s+(?:และ|หรือ|กับ|พร้อม|ที่|ซึ่ง|ลง|ตา|รับรอง|มี|ใน|รวม|ทั้ง|ขอ|ลายมือ)",
                 name, maxsplit=1,
             )[0].strip()
-            # ตัด ถ้ามีคำว่า "หรือ"+คำนำหน้าติดกัน (เช่น "หรือนางสาว")
             name = re.split(r"(?:หรือ|และ)(?:นาย|นาง|น\.ส\.|นางสาว)", name, maxsplit=1)[0].strip()
-            # ตัด suffix เป็นตัวเลข/คำสั้น (เช่น "5", "ก.")
             name = re.sub(r"\s+[ก-๛]{1}\.?$", "", name).strip()
-            if _is_real_name(name) and name not in into:
-                into.append(name)
-
-    # 1. จาก info_text — "กรรมการซึ่งลงชื่อผูกพัน..."
-    if info_text:
-        m = re.search(
-            r"กรรมการซึ่งลงชื่อผูกพัน(?:บริษัท)?ได้\s+([\s\S]+?)"
-            r"(?:พร้อม|ประทับ|ข้อจำกัด|สำคัญของบริษัท|รายชื่อผู้|\Z)",
-            info_text,
-        )
-        if m:
-            block = m.group(1)
-            _scan_text_for_names(block, names)
-            # ถ้า block บอกว่า "กรรมการ X คนลงลายมือชื่อร่วมกัน" (ไม่เจาะจง)
-            # → ใช้ directors ทุกคน
-            if not names and re.search(
-                r"กรรมการ(?:สอง|สาม|สี่|ห้า|หก|\d+)\s*คน(?:ใด)?\s*ลง"
-                r"|กรรมการลงลายมือชื่อร่วมกัน"
-                r"|กรรมการคนใดคนหนึ่ง",
-                block,
-            ):
-                use_all_dirs = True
-
-    # 2. จากไฟล์ที่ submitList ระบุ (authority_doc) — เสริมถ้าเจอเพิ่ม
-    if sl_authority_files:
-        for fname in sl_authority_files:
-            p = find_by_original(vf, fname)
-            if not p:
-                continue
-            t = _read(p, unread=unread, label="ผู้มีอำนาจควบคุม")
-            if not t:
-                continue
-            # หา section ผู้มีอำนาจ ในไฟล์
-            # ลอง pattern หลาย รูป
-            block = t
-            section_m = re.search(
-                r"(?:ผู้มีอำนาจ|ลายมือชื่อผู้|กรรมการผู้มีอำนาจ)[\s\S]{0,2000}",
-                t,
-            )
-            if section_m:
-                block = section_m.group(0)
-            _scan_text_for_names(block, names)
-            if len(names) >= 2:
-                break
-
-    # 3. fallback: ใช้ directors ทั้งหมด (กรณีบริษัทใช้สูตร "กรรมการ X คน")
-    if not names and use_all_dirs and directors:
-        return "\n".join(f"{i+1}. {n}" for i, n in enumerate(directors[:10])) \
-               + "\n(กรรมการลงลายมือชื่อร่วมกัน)"
-
-    # 4. fallback: บริษัทกรรมการคนเดียว → director นั้นคือ authority
-    if not names and directors and len(directors) == 1:
-        return f"1. {directors[0]}"
+            # normalize spaces ก่อนเช็ค dup (เผื่อ PDF artifact "นายอภิศักด ิ์")
+            norm = re.sub(r"\s+", "", name)
+            if _is_real_name(name) and norm not in {re.sub(r"\s+", "", x) for x in names}:
+                names.append(name)
+        if names:
+            break  # เจอชื่อแล้ว ไม่ต้องดูไฟล์อื่น
 
     if not names:
         return "-"
@@ -610,30 +575,36 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
     if not d.name:
         d.name = _extract_name_from_zip(vf.source_zip)
 
-    # authority
+    # authority — ใช้เฉพาะไฟล์จาก submitList หมวด "ผู้มีอำนาจควบคุม"
     d.authority = _extract_authority(
-        vf, info_text,
+        vf,
         sl_authority_files=sl_get_files(sl, "authority_doc"),
-        directors=d.directors,
         unread=d.unread_files,
     )
 
     # ── 2. ผู้ถือหุ้น >25% ──────────────────────────────────────────────────
     sh_path = None
+    sh_source = ""   # "สารบัญ" หรือ "shareholder file"
     for fname in sl_get_files(sl, "shareholder_doc"):
         p = find_by_original(vf, fname)
         if p:
             sh_path = p
+            sh_source = "สารบัญ submitList"
             break
     if not sh_path:
         sh_path = find_file(vf, "shareholder")
+        if sh_path:
+            sh_source = "shareholder file"
 
+    has_major_holder = False   # ใช้ตัดสิน ✓/- ใน Section 1 col "ผู้ถือหุ้นรายใหญ่"
     if sh_path:
         sh_text = _read(sh_path, unread=d.unread_files, label="ผู้ถือหุ้น")
         sh_tables = _read_tables(sh_path)
         holders = find_shareholder_over(sh_text, threshold=25.0, tables=sh_tables)
         if holders:
-            d.shareholders = "\n".join(f"{n} ({p:.2f}%)" for n, p in holders)
+            has_major_holder = True
+            lines = [f"{n} ({p:.2f}%)" for n, p in holders]
+            d.shareholders = "\n".join(lines) + f"\n(วิเคราะห์ >25% จาก {sh_source})"
 
     # ── 3. มูลค่าสุทธิ ──────────────────────────────────────────────────────
     fin_path = None
@@ -662,7 +633,6 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
         d.cert            = CHECK if sl_has_doc(sl, "cert")            else DASH
         d.memo            = CHECK if sl_has_doc(sl, "memo")            else DASH
         d.director_list   = CHECK if sl_has_doc(sl, "director_list")   else DASH
-        d.shareholder_doc = CHECK if sl_has_doc(sl, "shareholder_doc") else DASH
         d.authority_doc   = CHECK if sl_has_doc(sl, "authority_doc")   else DASH
         d.credit          = CHECK if sl_has_doc(sl, "credit")          else DASH
         d.trade_reg       = CHECK if sl_has_doc(sl, "trade_reg")       else DASH
@@ -674,7 +644,6 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
                                        or find_file(vf, "MEMIMG")
                                        or find_file(vf, "บริคณห์")) else DASH
         d.director_list   = d.cert
-        d.shareholder_doc = CHECK if find_file(vf, "shareholder") else DASH
         d.authority_doc   = CHECK if (find_file(vf, "ผู้มีอำนาจควบคุม")
                                        or find_file(vf, "OBJMGR")) else DASH
         d.trade_reg       = CHECK if (find_file(vf, "ทะเบียนพาณิชย์")
@@ -682,6 +651,10 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
         d.vat             = CHECK if (find_file(vf, "ภพ20") or find_file(vf, "ภพ.20")
                                        or find_file(vf, "ภ.พ.20")
                                        or find_file(vf, "ภ พ 20")) else DASH
+
+    # ผู้ถือหุ้นรายใหญ่ — ✓ เฉพาะเมื่อมี holder > 25% จริง
+    # (ไม่ใช่แค่ยื่นไฟล์ shareholder)
+    d.shareholder_doc = CHECK if has_major_holder else DASH
 
     # ── 6. ส่วนที่ 2: filename pattern matching ─────────────────────────────
     candidates = _collect_part2_candidates(sl, vf)

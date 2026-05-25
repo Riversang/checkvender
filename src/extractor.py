@@ -137,35 +137,50 @@ def find_by_original(vf: VendorFiles, original_name: str) -> Optional[str]:
     หา file path จากชื่อ original (basename) ที่ระบุใน submitList
     รองรับ fuzzy match:
       - submitList ระบุ "X.pdf" แต่ไฟล์จริงเป็น "X_<hash>.pdf"
-      - มี space ต่างกัน
+      - submitList ใส่ "1.หนังสือ" แต่ไฟล์จริงเป็น "1หนังสือ"
+      - space/dot/dash อยู่ต่างที่กัน
+
+    Strategy:
+      1. Normalize: lowercase + strip whitespace
+      2. Stem: ตัด extension + hash suffix
+      3. Loose: ตัดสัญลักษณ์ทั้งหมด (.,-_() etc)
     """
     def _norm(s: str) -> str:
         return re.sub(r"\s+", "", s).lower()
 
     def _stem(s: str) -> str:
-        # ตัด extension + ตัด hash suffix แบบ "_<hex>"
         base = os.path.splitext(s)[0]
-        # ตัด trailing "_<hex chars>" ที่ระบบ e-GP เพิ่ม
+        # ตัด trailing "_<hex>" หรือ "_<hex>_<digits>_sys" ของ e-GP
         base = re.sub(r"_[0-9a-f]{8,}(?:_\d+_sys)?$", "", base, flags=re.IGNORECASE)
         return _norm(base)
 
+    def _loose(s: str) -> str:
+        """ตัดสัญลักษณ์ทั้งหมด เหลือเฉพาะตัวอักษร/ตัวเลข"""
+        # ตัด extension + hash + สัญลักษณ์
+        s = _stem(s)
+        # เก็บเฉพาะ Thai chars (ก-๛), English letters, digits
+        return re.sub(r"[^ก-๛a-z0-9]+", "", s)
+
     target_full = _norm(original_name)
     target_stem = _stem(original_name)
+    target_loose = _loose(original_name)
 
-    # 1. exact match (full filename รวม .pdf)
+    # 1. exact match
     for safe, orig in vf.original_names.items():
         if _norm(orig) == target_full:
             return os.path.join(vf.extract_dir, safe)
-    # 2. stem match (ตัด hash suffix และ extension)
+    # 2. stem match
     for safe, orig in vf.original_names.items():
         if _stem(orig) == target_stem:
             return os.path.join(vf.extract_dir, safe)
-    # 3. substring (full)
-    for safe, orig in vf.original_names.items():
-        if target_full in _norm(orig):
-            return os.path.join(vf.extract_dir, safe)
-    # 4. substring (stem)
-    for safe, orig in vf.original_names.items():
-        if target_stem and target_stem in _stem(orig):
-            return os.path.join(vf.extract_dir, safe)
+    # 3. loose match (ตัดสัญลักษณ์ทั้งหมด)
+    if target_loose:
+        for safe, orig in vf.original_names.items():
+            if _loose(orig) == target_loose:
+                return os.path.join(vf.extract_dir, safe)
+    # 4. substring (loose)
+    if target_loose:
+        for safe, orig in vf.original_names.items():
+            if target_loose in _loose(orig) or _loose(orig) in target_loose:
+                return os.path.join(vf.extract_dir, safe)
     return None

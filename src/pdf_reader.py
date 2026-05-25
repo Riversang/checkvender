@@ -90,10 +90,11 @@ MAX_CID_RATIO = 0.05       # สัดส่วน (cid:xxx) สูงสุด
 # Claude vision settings
 CLAUDE_MODEL = "claude-sonnet-4-5"
 CLAUDE_MAX_PAGES = 5       # อ่าน vision สูงสุด 5 หน้าต่อไฟล์ (ประหยัด token)
+CLAUDE_DPI = 250           # 250 DPI (สูงกว่า 200 เดิม เพื่อให้ font เล็กชัด)
 
-# Tesseract settings
+# Tesseract settings — สูง DPI = อ่านได้ละเอียดขึ้น (เสมือน zoom เอกสาร)
 TESSERACT_LANG = "tha+eng"     # ใช้ทั้งไทย + อังกฤษ
-TESSERACT_DPI = 300            # 300 DPI สำหรับ OCR ละเอียด
+TESSERACT_DPI = 400            # 400 DPI (เพิ่มจาก 300 เพื่อความแม่นกับ font เล็ก)
 TESSERACT_MAX_PAGES = 8        # อ่าน OCR สูงสุด 8 หน้าต่อไฟล์
 
 
@@ -251,7 +252,7 @@ def _read_claude_vision(path: str) -> str:
         images = []
         for i in range(n_pages):
             page = doc[i]
-            pix = page.get_pixmap(dpi=200)   # 200 DPI สำหรับ OCR ละเอียด
+            pix = page.get_pixmap(dpi=CLAUDE_DPI)
             img_bytes = pix.tobytes("png")
             images.append(base64.standard_b64encode(img_bytes).decode())
         doc.close()
