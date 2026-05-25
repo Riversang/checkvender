@@ -33,6 +33,53 @@ try:
 except ImportError:
     _HAS_ANTHROPIC = False
 
+try:
+    import pytesseract
+    from PIL import Image
+    _HAS_TESSERACT = True
+except ImportError:
+    _HAS_TESSERACT = False
+
+# detect tesseract executable (Windows: ลองหาที่ install ทั่วไป)
+_TESSERACT_CHECKED = False
+_TESSERACT_OK = False
+
+
+def _ensure_tesseract() -> bool:
+    """ตรวจ + ตั้ง path ของ tesseract.exe (สำหรับ Windows)"""
+    global _TESSERACT_CHECKED, _TESSERACT_OK
+    if _TESSERACT_CHECKED:
+        return _TESSERACT_OK
+    _TESSERACT_CHECKED = True
+    if not _HAS_TESSERACT:
+        return False
+    try:
+        # ลองรัน tesseract เพื่อเช็คว่ามีไหม
+        pytesseract.get_tesseract_version()
+        _TESSERACT_OK = True
+        return True
+    except (pytesseract.TesseractNotFoundError, Exception):
+        pass
+    # ลองหาที่ install ทั่วไปบน Windows
+    candidates = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
+        # portable: ลองหา tesseract.exe ใน WinPython folder
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     "tesseract", "tesseract.exe"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            pytesseract.pytesseract.tesseract_cmd = p
+            try:
+                pytesseract.get_tesseract_version()
+                _TESSERACT_OK = True
+                return True
+            except Exception:
+                continue
+    return False
+
 # pattern ที่บ่งบอกว่า PDF เป็นภาพสแกน
 _CID_PATTERN = re.compile(r"\(cid:\d+\)")
 
@@ -44,10 +91,16 @@ MAX_CID_RATIO = 0.05       # สัดส่วน (cid:xxx) สูงสุด
 CLAUDE_MODEL = "claude-sonnet-4-5"
 CLAUDE_MAX_PAGES = 5       # อ่าน vision สูงสุด 5 หน้าต่อไฟล์ (ประหยัด token)
 
+# Tesseract settings
+TESSERACT_LANG = "tha+eng"     # ใช้ทั้งไทย + อังกฤษ
+TESSERACT_DPI = 300            # 300 DPI สำหรับ OCR ละเอียด
+TESSERACT_MAX_PAGES = 8        # อ่าน OCR สูงสุด 8 หน้าต่อไฟล์
+
 
 # ─── ระดับคุณภาพข้อความ ──────────────────────────────────────────────────────
 
 _THAI_CHAR_RE = re.compile(r"[ก-๛]")
+_GARBLED_CHARS_RE = re.compile(r"[+#%&*|<>~`@^]")
 _COMMON_THAI_WORDS = (
     "บริษัท", "หจก", "ห้าง", "นาย", "นาง", "หุ้น", "กรรมการ",
     "ทะเบียน", "เลข", "ผู้", "ที่", "ใน", "การ", "ของ", "และ",
@@ -60,7 +113,8 @@ def _quality_ok(text: str) -> bool:
       - ยาวพอ
       - มี cid:xxx น้อย
       - มีตัวอักษรไทยในสัดส่วนที่สมเหตุสมผล
-      - มีคำไทยทั่วไป (กันกรณี font garbled ที่เห็นเป็น ASCII punctuation)
+      - มีคำไทยทั่วไป
+      - ไม่มี ASCII punctuation หนาแน่นเกินไป (สัญลักษณ์ของ custom font ที่อ่านไม่ออก)
     """
     if not text or len(text.strip()) < MIN_TEXT_LEN:
         return False
@@ -74,6 +128,11 @@ def _quality_ok(text: str) -> bool:
         return False
     # ไม่มีคำไทยทั่วไปเลย → likely garbled
     if total > 200 and not any(w in text for w in _COMMON_THAI_WORDS):
+        return False
+    # ASCII punctuation หนาแน่น → likely garbled font output
+    # (เช่น DBD บอจ.5 ที่ใช้ font ฝัง — ออกเป็น '+/)-00 000 %6)-##.+#.')
+    garbled = len(_GARBLED_CHARS_RE.findall(text))
+    if total > 200 and garbled / total > 0.025:
         return False
     return True
 
@@ -116,7 +175,42 @@ def _read_pymupdf(path: str) -> str:
         return ""
 
 
-# ─── ชั้นที่ 3: Claude Vision ─────────────────────────────────────────────────
+# ─── ชั้นที่ 3: Tesseract OCR (ฟรี, ใช้ได้ local) ────────────────────────────
+
+def _read_tesseract(path: str) -> str:
+    """
+    OCR ด้วย Tesseract (ฟรี local) — ใช้กับ PDF ภาพสแกน + font ฝังที่อ่านไม่ออก
+    ต้อง install tesseract.exe + tha.traineddata + pip install pytesseract Pillow
+    """
+    if not (_HAS_TESSERACT and _HAS_PYMUPDF):
+        return ""
+    if not _ensure_tesseract():
+        return ""
+
+    try:
+        doc = pymupdf.open(path)
+        n_pages = min(len(doc), TESSERACT_MAX_PAGES)
+        texts: list[str] = []
+        for i in range(n_pages):
+            page = doc[i]
+            pix = page.get_pixmap(dpi=TESSERACT_DPI)
+            img_bytes = pix.tobytes("png")
+            from io import BytesIO
+            img = Image.open(BytesIO(img_bytes))
+            try:
+                t = pytesseract.image_to_string(img, lang=TESSERACT_LANG)
+            except pytesseract.TesseractError:
+                # fallback: ใช้แค่ eng ถ้าไม่มี tha pack
+                t = pytesseract.image_to_string(img, lang="eng")
+            texts.append(t)
+        doc.close()
+        return "\n".join(texts).strip()
+    except Exception as e:
+        print(f"    [Tesseract error: {e}]")
+        return ""
+
+
+# ─── ชั้นที่ 4: Claude Vision ─────────────────────────────────────────────────
 
 def _read_claude_vision(path: str) -> str:
     """
@@ -232,25 +326,37 @@ def read_pdf_text(path: str, use_vision: bool = True) -> tuple[str, bool]:
     # เลือกตัวที่ยาวกว่าระหว่าง 2 ชั้นแรก (เผื่อมีข้อมูลบางส่วน)
     best = text if len(text) > len(text2) else text2
 
-    # ชั้นที่ 3: Claude Vision (ถ้าเปิดและตั้ง API key)
-    if use_vision:
-        text3 = _read_claude_vision(path)
-        if _quality_ok(text3):
-            return text3, True
-        if len(text3) > len(best):
-            best = text3
+    # ชั้นที่ 3: Tesseract OCR (ฟรี, local)
+    text3 = _read_tesseract(path)
+    if _quality_ok(text3):
+        return _clean(text3), True
+    if len(text3) > len(best):
+        best = text3
 
-    # ถ้ามาถึงตรงนี้แสดงว่า text ทุกชั้นไม่ดีพอ
-    # แจ้ง user ว่าไฟล์นี้ต้อง OCR (ถ้ายังไม่ได้ใช้ Vision)
+    # ชั้นที่ 4: Claude Vision (ถ้าเปิดและตั้ง API key)
+    if use_vision:
+        text4 = _read_claude_vision(path)
+        if _quality_ok(text4):
+            return text4, True
+        if len(text4) > len(best):
+            best = text4
+
+    # ถ้ามาถึงตรงนี้แสดงว่า text ทุกชั้นไม่ดีพอ — แจ้ง user
     if not _quality_ok(best):
         api_key_set = bool(os.environ.get("ANTHROPIC_API_KEY", "").strip()) or \
                       os.path.exists(os.path.join(
                           os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                           "config", "api_key.txt"))
-        if not api_key_set:
+        tess_ok = _ensure_tesseract()
+        if not (tess_ok or api_key_set):
             print(f"    ⚠ อ่าน PDF ไม่ออก (font แปลก/ภาพสแกน): "
                   f"{os.path.basename(path)}")
-            print(f"      → ต้องตั้ง ANTHROPIC_API_KEY เพื่อใช้ Vision OCR")
+            print(f"      → ติดตั้ง Tesseract (install_tesseract.bat) "
+                  f"หรือตั้ง ANTHROPIC_API_KEY (set_api_key.bat)")
+        elif not api_key_set and tess_ok:
+            # มี Tesseract แต่ก็ยัง OCR ไม่ออก
+            print(f"    ⚠ Tesseract อ่านไม่ออก: {os.path.basename(path)}")
+            print(f"      → ลองตั้ง ANTHROPIC_API_KEY เพื่อใช้ Vision (แม่นกว่า)")
 
     return _clean(best), False
 

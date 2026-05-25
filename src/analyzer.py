@@ -227,21 +227,29 @@ def _is_real_name(name: str) -> bool:
 
 
 def _extract_authority(vf: VendorFiles, info_text: str = "",
-                       sl_authority_files: list[str] = None) -> str:
+                       sl_authority_files: list[str] = None,
+                       directors: list[str] = None) -> str:
     """
     ดึงรายชื่อผู้มีอำนาจควบคุมจาก:
       1. กรรมการที่ลงชื่อผูกพันบริษัท (จาก juristic_information)
       2. ไฟล์ "บัญชีผู้มีอำนาจควบคุม" (ที่ submitList ระบุไว้)
+      3. ถ้าบริษัทใช้สูตร "กรรมการ X คนลงลายมือชื่อร่วมกัน" → คืน directors ทุกคน
 
     ไม่อ่าน OBJMGR — เพราะเป็นไฟล์ "วัตถุประสงค์" ไม่ใช่อำนาจ
     """
     names: list[str] = []
+    use_all_dirs = False
 
     def _scan_text_for_names(text: str, into: list[str]):
         """หาชื่อในข้อความและเติมใส่ list (dedupe)"""
+        # negative lookahead: หยุดถ้าคำถัดไปเป็น connector (และ/หรือ/etc)
         for nm in re.finditer(
-            r"((?:นาย|นาง|น\.ส\.|นางสาว|Mr\.?|Mrs\.?)\s*[ก-๛]{2,15}"
-            r"(?:\s+[ก-๛]{2,25}){0,3})",
+            r"((?:นาย|นาง|น\.ส\.|นางสาว|Mr\.?|Mrs\.?)"
+            r"\s*[ก-๛]{2,15}"           # first name
+            r"(?:\s+(?!และ|หรือ|กับ|พร้อม|ลง|ที่|ซึ่ง|รับรอง|รวม|มี|ใน|ทั้ง|ขอ|ลายมือ"
+            r"|กรรมการ|ประทับ|ลายมือชื่อ|ตา|คนใด|คนหนึ่ง|สำคัญ)"
+            r"[ก-๛]{2,25}){0,2}"        # last name (+ optional middle), max 2 tokens
+            r")",
             text,
         ):
             name = re.sub(r"\s+", " ", nm.group(1)).strip()
@@ -265,7 +273,17 @@ def _extract_authority(vf: VendorFiles, info_text: str = "",
             info_text,
         )
         if m:
-            _scan_text_for_names(m.group(1), names)
+            block = m.group(1)
+            _scan_text_for_names(block, names)
+            # ถ้า block บอกว่า "กรรมการ X คนลงลายมือชื่อร่วมกัน" (ไม่เจาะจง)
+            # → ใช้ directors ทุกคน
+            if not names and re.search(
+                r"กรรมการ(?:สอง|สาม|สี่|ห้า|หก|\d+)\s*คน(?:ใด)?\s*ลง"
+                r"|กรรมการลงลายมือชื่อร่วมกัน"
+                r"|กรรมการคนใดคนหนึ่ง",
+                block,
+            ):
+                use_all_dirs = True
 
     # 2. จากไฟล์ที่ submitList ระบุ (authority_doc) — เสริมถ้าเจอเพิ่ม
     if sl_authority_files:
@@ -288,6 +306,11 @@ def _extract_authority(vf: VendorFiles, info_text: str = "",
             _scan_text_for_names(block, names)
             if len(names) >= 2:
                 break
+
+    # 3. fallback: ใช้ directors ทั้งหมด (กรณีบริษัทใช้สูตร "กรรมการ X คน")
+    if not names and use_all_dirs and directors:
+        return "\n".join(f"{i+1}. {n}" for i, n in enumerate(directors[:10])) \
+               + "\n(กรรมการลงลายมือชื่อร่วมกัน)"
 
     if not names:
         return "-"
@@ -529,6 +552,7 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
     d.authority = _extract_authority(
         vf, info_text,
         sl_authority_files=sl_get_files(sl, "authority_doc"),
+        directors=d.directors,
     )
 
     # ── 2. ผู้ถือหุ้น >25% ──────────────────────────────────────────────────
