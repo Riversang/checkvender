@@ -101,6 +101,7 @@ TESSERACT_MAX_PAGES = 8        # อ่าน OCR สูงสุด 8 หน้
 # ─── ระดับคุณภาพข้อความ ──────────────────────────────────────────────────────
 
 _THAI_CHAR_RE = re.compile(r"[ก-๛]")
+_THAI_RUN_RE = re.compile(r"[ก-๛]+")     # ลำดับ Thai chars ติดกัน (ไม่นับ space)
 _GARBLED_CHARS_RE = re.compile(r"[+#%&*|<>~`@^]")
 # Latin Extended chars ที่มัก override Thai glyphs ใน font subset
 # (เช่น เลĂทัด, ýุภดิลก, บริþัท)
@@ -117,8 +118,10 @@ def _quality_ok(text: str) -> bool:
       - ยาวพอ
       - มี cid:xxx น้อย
       - มีตัวอักษรไทยในสัดส่วนที่สมเหตุสมผล
-      - มีคำไทยทั่วไป
-      - ไม่มี ASCII punctuation หนาแน่นเกินไป (สัญลักษณ์ของ custom font ที่อ่านไม่ออก)
+      - มีคำไทยทั่วไป (สำหรับ text ทุกความยาว)
+      - มีคำไทยติดกันยาวพอ (ไม่ใช่ text ที่แตกตัวอักษรเป็นแนวตั้ง)
+      - ไม่มี ASCII punctuation หนาแน่นเกินไป (custom font garbled)
+      - ไม่มี Latin Extended แทรก Thai (font CMap substitution)
     """
     if not text or len(text.strip()) < MIN_TEXT_LEN:
         return False
@@ -128,20 +131,27 @@ def _quality_ok(text: str) -> bool:
         return False
     # ratio ตัวอักษรไทยต่ำ → likely garbled
     thai_chars = len(_THAI_CHAR_RE.findall(text))
-    if total > 200 and thai_chars / total < 0.10:
+    if thai_chars > 0 and total > 100 and thai_chars / total < 0.10:
         return False
-    # ไม่มีคำไทยทั่วไปเลย → likely garbled
-    if total > 200 and not any(w in text for w in _COMMON_THAI_WORDS):
+    # text ที่ยาวพอแต่ไม่มีคำไทยทั่วไป → garbled หรือไม่ใช่เอกสารจริง
+    if total > 50 and not any(w in text for w in _COMMON_THAI_WORDS):
         return False
     # ASCII punctuation หนาแน่น → likely garbled font output
-    # (เช่น DBD บอจ.5 ที่ใช้ font ฝัง — ออกเป็น '+/)-00 000 %6)-##.+#.')
     garbled = len(_GARBLED_CHARS_RE.findall(text))
     if total > 200 and garbled / total > 0.025:
         return False
     # Latin Extended chars แทรกใน Thai → font CMap substitution
-    # (เช่น "บริþัท เซลÿุกิ" หรือ "เลĂทัด ýุภดิลก")
     latin_ext = len(_LATIN_EXT_RE.findall(text))
     if total > 200 and latin_ext / total > 0.02:
+        return False
+    # ไม่มีคำไทยติดกันยาวพอ (≥ 4 chars) → likely vertically-broken text
+    # เช่น "ง\nา\nจ\nด\nจั\nอ\nซื้" — chars แตกเป็นแนวตั้ง
+    longest_run = 0
+    for m in _THAI_RUN_RE.finditer(text):
+        longest_run = max(longest_run, len(m.group(0)))
+        if longest_run >= 5:
+            break
+    if thai_chars >= 10 and longest_run < 5:
         return False
     return True
 
