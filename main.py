@@ -141,6 +141,19 @@ def main():
     print(f"   ผู้ยื่น  : {len(vendors)} ราย")
     print(f"   Output  : {os.path.abspath(out_path)}")
 
+    # ── สรุปไฟล์ที่อ่านไม่ออก (ถ้ามี) ───────────────────────────────────────
+    vendors_with_unread = [v for v in vendors if v.unread_files]
+    if vendors_with_unread:
+        print()
+        print("⚠  ไฟล์ที่อ่านไม่ออก (ข้อมูลในช่องเกี่ยวข้องอาจไม่ปรากฏใน Excel)")
+        for v in vendors_with_unread:
+            print(f"   • {v.name or '(ไม่ทราบชื่อ)'}:")
+            for f in v.unread_files:
+                print(f"       - {f}")
+        print()
+        print("   วิธีแก้: ติดตั้ง Tesseract OCR (install_tesseract.bat)")
+        print("           หรือตั้ง ANTHROPIC_API_KEY (set_api_key.bat)")
+
 
 if __name__ == "__main__":
     main()

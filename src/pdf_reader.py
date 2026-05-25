@@ -308,7 +308,7 @@ def read_pdf_tables(path: str) -> list:
 
 def read_pdf_text(path: str, use_vision: bool = True) -> tuple[str, bool]:
     """
-    อ่าน PDF แบบหลายชั้น คืน (text, used_vision)
+    อ่าน PDF แบบหลายชั้น คืน (text, is_good_quality)
 
     Parameters
     ----------
@@ -318,18 +318,19 @@ def read_pdf_text(path: str, use_vision: bool = True) -> tuple[str, bool]:
 
     Returns
     -------
-    text         : ข้อความที่อ่านได้
-    used_vision  : True ถ้าใช้ Claude Vision (ใช้สำหรับ debug)
+    text             : ข้อความที่อ่านได้
+    is_good_quality  : True ถ้ามีชั้นใดผ่าน _quality_ok (อ่านได้สมบูรณ์)
+                       False ถ้าทุกชั้น fail (text อาจอ่านได้บางส่วนแต่ขาดข้อมูล)
     """
     # ชั้นที่ 1: pdfplumber
     text = _read_pdfplumber(path)
     if _quality_ok(text):
-        return _clean(text), False
+        return _clean(text), True
 
     # ชั้นที่ 2: pymupdf
     text2 = _read_pymupdf(path)
     if _quality_ok(text2):
-        return _clean(text2), False
+        return _clean(text2), True
 
     # เลือกตัวที่ยาวกว่าระหว่าง 2 ชั้นแรก (เผื่อมีข้อมูลบางส่วน)
     best = text if len(text) > len(text2) else text2
@@ -350,21 +351,19 @@ def read_pdf_text(path: str, use_vision: bool = True) -> tuple[str, bool]:
             best = text4
 
     # ถ้ามาถึงตรงนี้แสดงว่า text ทุกชั้นไม่ดีพอ — แจ้ง user
-    if not _quality_ok(best):
-        api_key_set = bool(os.environ.get("ANTHROPIC_API_KEY", "").strip()) or \
-                      os.path.exists(os.path.join(
-                          os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                          "config", "api_key.txt"))
-        tess_ok = _ensure_tesseract()
-        if not (tess_ok or api_key_set):
-            print(f"    ⚠ อ่าน PDF ไม่ออก (font แปลก/ภาพสแกน): "
-                  f"{os.path.basename(path)}")
-            print(f"      → ติดตั้ง Tesseract (install_tesseract.bat) "
-                  f"หรือตั้ง ANTHROPIC_API_KEY (set_api_key.bat)")
-        elif not api_key_set and tess_ok:
-            # มี Tesseract แต่ก็ยัง OCR ไม่ออก
-            print(f"    ⚠ Tesseract อ่านไม่ออก: {os.path.basename(path)}")
-            print(f"      → ลองตั้ง ANTHROPIC_API_KEY เพื่อใช้ Vision (แม่นกว่า)")
+    api_key_set = bool(os.environ.get("ANTHROPIC_API_KEY", "").strip()) or \
+                  os.path.exists(os.path.join(
+                      os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                      "config", "api_key.txt"))
+    tess_ok = _ensure_tesseract()
+    if not (tess_ok or api_key_set):
+        print(f"    ⚠ อ่าน PDF ไม่ออก (font แปลก/ภาพสแกน): "
+              f"{os.path.basename(path)}")
+        print(f"      → ติดตั้ง Tesseract (install_tesseract.bat) "
+              f"หรือตั้ง ANTHROPIC_API_KEY (set_api_key.bat)")
+    elif not api_key_set and tess_ok:
+        print(f"    ⚠ Tesseract อ่านไม่ออก: {os.path.basename(path)}")
+        print(f"      → ลองตั้ง ANTHROPIC_API_KEY เพื่อใช้ Vision (แม่นกว่า)")
 
     return _clean(best), False
 

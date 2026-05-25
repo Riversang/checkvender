@@ -202,6 +202,27 @@ if st.button("▶ ตรวจเอกสาร", type="primary", use_container
     in_budget = sum(1 for v in vendors if v.price <= budget)
     col_c.metric("ราคาไม่เกินวงเงิน", f"{in_budget}/{len(vendors)}")
 
+    # ── เตือนไฟล์ที่อ่านไม่ออก ──
+    vendors_with_unread = [v for v in vendors if v.unread_files]
+    if vendors_with_unread:
+        with st.expander(
+            f"⚠ มีไฟล์ {sum(len(v.unread_files) for v in vendors_with_unread)} "
+            f"ไฟล์ที่อ่านไม่ออก (ใน {len(vendors_with_unread)} บริษัท)",
+            expanded=True,
+        ):
+            st.warning(
+                "ไฟล์เหล่านี้ใช้ font ฝังเฉพาะ หรือเป็นภาพสแกน — "
+                "ข้อมูลในช่องที่เกี่ยวข้องอาจไม่ปรากฏใน Excel"
+            )
+            for v in vendors_with_unread:
+                st.markdown(f"**{v.name or '(ไม่ทราบชื่อ)'}**")
+                for f in v.unread_files:
+                    st.text(f"   • {f}")
+            st.info(
+                "วิธีแก้: ตั้งค่า `ANTHROPIC_API_KEY` ใน Streamlit Secrets "
+                "เพื่อใช้ Claude Vision OCR (หรือถ้ารัน local ให้ใช้ Tesseract)"
+            )
+
     # ตารางสรุป
     import pandas as pd
     df = pd.DataFrame([{

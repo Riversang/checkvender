@@ -159,7 +159,18 @@ def _build_sheet2(wb, vendors: list[VendorData], project_name: str):
         _sc(ws, row, 9,  v.line_license, fill=ll_fill)
         _sc(ws, row, 10, v.other1 or "", fill=fill)
         _sc(ws, row, 11, "",             fill=fill)
-        _sc(ws, row, 12, v.other1_note or "", fill=fill, align=_left())
+        # หมายเหตุ: รวม other1_note + warning ไฟล์อ่านไม่ออก
+        note_parts = []
+        if v.other1_note:
+            note_parts.append(v.other1_note)
+        if v.unread_files:
+            note_parts.append("⚠ อ่านไม่ออก (ต้อง OCR): "
+                              + ", ".join(v.unread_files[:3])
+                              + (f" +{len(v.unread_files)-3}"
+                                 if len(v.unread_files) > 3 else ""))
+        note_fill = WARN_FILL if v.unread_files else fill
+        _sc(ws, row, 12, "\n".join(note_parts),
+            fill=note_fill, align=_left())
 
     _summary_row(ws, ncols, len(vendors), 4 + len(vendors))
     _page_landscape(ws)
@@ -213,7 +224,15 @@ def _build_sheet1(wb, vendors: list[VendorData], project_name: str):
         _sc(ws, row, 12, v.joint,            fill=fill)
         _sc(ws, row, 13, v.integrity,        fill=fill)
         _sc(ws, row, 14, v.anti_corrupt,     fill=fill)
-        _sc(ws, row, 15, "",                 fill=fill)
+        # หมายเหตุ: warning ไฟล์อ่านไม่ออก
+        if v.unread_files:
+            note = ("⚠ อ่านไม่ออก (ต้อง OCR): "
+                    + ", ".join(v.unread_files[:3])
+                    + (f" +{len(v.unread_files)-3}"
+                       if len(v.unread_files) > 3 else ""))
+            _sc(ws, row, 15, note, fill=WARN_FILL, align=_left())
+        else:
+            _sc(ws, row, 15, "", fill=fill)
 
     _summary_row(ws, ncols, len(vendors), 4 + len(vendors))
     _page_portrait(ws)

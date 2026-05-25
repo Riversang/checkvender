@@ -78,14 +78,28 @@ class VendorData:
     other1_note: str = ""
 
     _notes: list[str] = field(default_factory=list)
+    unread_files: list[str] = field(default_factory=list)  # ไฟล์ที่อ่านไม่ออก (ต้อง OCR)
 
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
 
-def _read(path: Optional[str]) -> str:
+def _read(path: Optional[str], unread: Optional[list] = None,
+          label: str = "") -> str:
+    """
+    อ่าน PDF + track ถ้าอ่านไม่ออก (font แปลก/ภาพสแกน)
+
+    Parameters
+    ----------
+    path   : path ของไฟล์
+    unread : list สำหรับเก็บ description ไฟล์ที่อ่านไม่ออก (ถ้า pass มา)
+    label  : ป้ายระบุประเภทไฟล์ (เช่น 'หนังสือรับรอง', 'ผู้ถือหุ้น')
+    """
     if not path or not os.path.exists(path):
         return ""
-    text, _ = read_pdf_text(path, use_vision=True)
+    text, is_good = read_pdf_text(path, use_vision=True)
+    if unread is not None and not is_good:
+        tag = f"{label} - " if label else ""
+        unread.append(f"{tag}{os.path.basename(path)}")
     return text
 
 
@@ -252,7 +266,8 @@ def _is_real_name(name: str) -> bool:
 
 def _extract_authority(vf: VendorFiles, info_text: str = "",
                        sl_authority_files: list[str] = None,
-                       directors: list[str] = None) -> str:
+                       directors: list[str] = None,
+                       unread: list = None) -> str:
     """
     ดึงรายชื่อผู้มีอำนาจควบคุมจาก:
       1. กรรมการที่ลงชื่อผูกพันบริษัท (จาก juristic_information)
@@ -315,7 +330,7 @@ def _extract_authority(vf: VendorFiles, info_text: str = "",
             p = find_by_original(vf, fname)
             if not p:
                 continue
-            t = _read(p)
+            t = _read(p, unread=unread, label="ผู้มีอำนาจควบคุม")
             if not t:
                 continue
             # หา section ผู้มีอำนาจ ในไฟล์
@@ -519,7 +534,7 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
     for fname in sl_get_files(sl, "cert"):
         p = find_by_original(vf, fname)
         if p:
-            t = _read(p)
+            t = _read(p, unread=d.unread_files, label="หนังสือรับรอง")
             if t:
                 cert_candidates.append((fname, t))
 
@@ -527,7 +542,9 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
     if not cert_candidates:
         p = find_file(vf, "juristic_information")
         if p:
-            cert_candidates.append(("juristic_information", _read(p)))
+            cert_candidates.append(("juristic_information",
+                                    _read(p, unread=d.unread_files,
+                                          label="หนังสือรับรอง")))
 
     # เลือกไฟล์ที่ extract directors ได้
     best_dirs: list[str] = []
@@ -598,6 +615,7 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
         vf, info_text,
         sl_authority_files=sl_get_files(sl, "authority_doc"),
         directors=d.directors,
+        unread=d.unread_files,
     )
 
     # ── 2. ผู้ถือหุ้น >25% ──────────────────────────────────────────────────
@@ -611,7 +629,7 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
         sh_path = find_file(vf, "shareholder")
 
     if sh_path:
-        sh_text = _read(sh_path)
+        sh_text = _read(sh_path, unread=d.unread_files, label="ผู้ถือหุ้น")
         sh_tables = _read_tables(sh_path)
         holders = find_shareholder_over(sh_text, threshold=25.0, tables=sh_tables)
         if holders:
@@ -628,7 +646,8 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
         fin_path = find_file(vf, "financial") or find_file(vf, "งบการเงิน")
 
     if fin_path:
-        val, sign = extract_net_worth(_read(fin_path))
+        val, sign = extract_net_worth(
+            _read(fin_path, unread=d.unread_files, label="งบการเงิน"))
         if val is not None:
             d.net_worth = val
             d.net_worth_sign = sign
@@ -674,6 +693,16 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
     d.mit          = CHECK if _has_in_files(candidates, _MIT_PATTERNS)       else DASH
     d.work_cert    = CHECK if _has_in_files(candidates, _WORK_CERT_PATTERNS) else DASH
     d.poa          = CHECK if _has_in_files(candidates, _POA_PATTERNS)       else DASH
+
+    # dedupe unread files (เก็บลำดับเดิม)
+    if d.unread_files:
+        seen: set = set()
+        deduped: list[str] = []
+        for f in d.unread_files:
+            if f not in seen:
+                seen.add(f)
+                deduped.append(f)
+        d.unread_files = deduped
 
     return d
 

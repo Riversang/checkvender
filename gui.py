@@ -349,6 +349,7 @@ class App(tk.Tk):
 
         self.log.tag_config("ok",   foreground=LOG_OK)
         self.log.tag_config("err",  foreground=LOG_ERR)
+        self.log.tag_config("warn", foreground="#FBBF24")     # amber
         self.log.tag_config("info", foreground=LOG_INFO)
         self.log.tag_config("dim",  foreground=LOG_DIM)
         self._log("› พร้อมใช้งาน — เพิ่มไฟล์ ZIP และกรอกข้อมูลโครงการ แล้วกด ▶ ตรวจเอกสาร",
@@ -592,8 +593,14 @@ class App(tk.Tk):
                 line = line.rstrip()
                 if not line:
                     continue
-                tag = "ok" if ("✅" in line or "🎉" in line) else \
-                      "err" if ("❌" in line or "Error" in line or "error" in line) else ""
+                if "✅" in line or "🎉" in line:
+                    tag = "ok"
+                elif "❌" in line or "Error" in line or "error" in line:
+                    tag = "err"
+                elif "⚠" in line:
+                    tag = "warn"        # ไฟล์ที่อ่านไม่ออก
+                else:
+                    tag = ""
                 self.after(0, self._log, line, tag)
             proc.wait()
 
