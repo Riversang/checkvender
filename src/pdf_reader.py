@@ -35,7 +35,10 @@ except ImportError:
 
 try:
     import pytesseract
-    from PIL import Image
+    from PIL import Image, ImageOps, ImageFilter
+    # ปลดล็อก image size limit สำหรับ OCR @1200 DPI (A4 ≈ 140M pixels)
+    # ปลอดภัยเพราะเรา process PDF ที่ trusted (จาก user เอง)
+    Image.MAX_IMAGE_PIXELS = None
     _HAS_TESSERACT = True
 except ImportError:
     _HAS_TESSERACT = False
@@ -92,10 +95,12 @@ CLAUDE_MODEL = "claude-sonnet-4-5"
 CLAUDE_MAX_PAGES = 5       # อ่าน vision สูงสุด 5 หน้าต่อไฟล์ (ประหยัด token)
 CLAUDE_DPI = 250           # 250 DPI (สูงกว่า 200 เดิม เพื่อให้ font เล็กชัด)
 
-# Tesseract settings — สูง DPI = อ่านได้ละเอียดขึ้น (เสมือน zoom เอกสาร)
+# Tesseract settings — DPI 600 + image preprocess + PSM 6 (sweet spot)
+# (1200 DPI + multi-PSM ช้าเกินไป ~11min/2vendors และไม่ได้ดีขึ้นพอจะคุ้ม)
 TESSERACT_LANG = "tha+eng"     # ใช้ทั้งไทย + อังกฤษ
-TESSERACT_DPI = 400            # 400 DPI (เพิ่มจาก 300 เพื่อความแม่นกับ font เล็ก)
-TESSERACT_MAX_PAGES = 8        # อ่าน OCR สูงสุด 8 หน้าต่อไฟล์
+TESSERACT_DPI = 600            # 600 DPI = ~2-3 sec/page, แม่นพอใช้
+TESSERACT_MAX_PAGES = 8
+TESSERACT_PSM_LIST = (6,)      # uniform block — เหมาะกับเอกสารราชการ
 
 
 # ─── ระดับคุณภาพข้อความ ──────────────────────────────────────────────────────
@@ -214,10 +219,59 @@ def _post_ocr_thai(text: str) -> str:
     return text
 
 
+def _preprocess_for_ocr(img):
+    """
+    ปรับภาพก่อนส่งให้ Tesseract เพื่อให้ OCR แม่นขึ้น:
+      1. grayscale (ลดสีรบกวน)
+      2. autocontrast (ดันความต่างขาว-ดำให้ชัด)
+      3. sharpen (เน้นเส้นขอบ — ช่วย Tesseract แยก vowel/tone marks)
+      4. binarize (threshold 180 — สีเทาเป็นขาว/ดำชัดเจน)
+    คืน PIL.Image ที่ preprocess แล้ว
+    """
+    img = img.convert("L")
+    img = ImageOps.autocontrast(img, cutoff=2)
+    img = img.filter(ImageFilter.SHARPEN)
+    # binarize: pixel > 180 → ขาว, อื่นๆ → ดำ
+    # ตัวอักษรที่จาง/blur จะถูก enhance ให้ชัดขึ้น
+    img = img.point(lambda x: 255 if x > 180 else 0, mode="1")
+    return img
+
+
+def _best_ocr(img, lang: str) -> str:
+    """
+    ลอง Tesseract หลาย PSM mode แล้วเลือก output ที่ดีที่สุด
+    (ที่ "ดีที่สุด" = มี Thai chars ติดกันยาวสุด หรือ output ยาวสุด)
+    """
+    best_text = ""
+    best_score = -1
+    for psm in TESSERACT_PSM_LIST:
+        try:
+            t = pytesseract.image_to_string(
+                img, lang=lang, config=f"--psm {psm}",
+            )
+        except pytesseract.TesseractError:
+            continue
+        # score: longest Thai run × 100 + total length (favor coherent output)
+        max_run = 0
+        for m in _THAI_RUN_RE.finditer(t):
+            max_run = max(max_run, len(m.group(0)))
+        score = max_run * 100 + len(t)
+        if score > best_score:
+            best_score = score
+            best_text = t
+    return best_text
+
+
 def _read_tesseract(path: str) -> str:
     """
     OCR ด้วย Tesseract (ฟรี local) — ใช้กับ PDF ภาพสแกน + font ฝังที่อ่านไม่ออก
     ต้อง install tesseract.exe + tha.traineddata + pip install pytesseract Pillow
+
+    Pipeline:
+      1. render PDF เป็นภาพ @ 600 DPI (เสมือน zoom 6 เท่า)
+      2. preprocess: grayscale + autocontrast + sharpen
+      3. Tesseract (tha+eng, PSM 6 = uniform block of text)
+      4. post-process: รวมตัวอักษรไทยที่ Tesseract แยกด้วย space
     """
     if not (_HAS_TESSERACT and _HAS_PYMUPDF):
         return ""
@@ -234,12 +288,11 @@ def _read_tesseract(path: str) -> str:
             img_bytes = pix.tobytes("png")
             from io import BytesIO
             img = Image.open(BytesIO(img_bytes))
-            try:
-                t = pytesseract.image_to_string(img, lang=TESSERACT_LANG)
-            except pytesseract.TesseractError:
-                # fallback: ใช้แค่ eng ถ้าไม่มี tha pack
-                t = pytesseract.image_to_string(img, lang="eng")
-            # post-process รวมตัวอักษรไทยที่ถูก space แยก
+            img = _preprocess_for_ocr(img)
+            # ลอง tha+eng ก่อน — fallback eng
+            t = _best_ocr(img, lang=TESSERACT_LANG)
+            if not t.strip():
+                t = _best_ocr(img, lang="eng")
             t = _post_ocr_thai(t)
             texts.append(t)
         doc.close()
