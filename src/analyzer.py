@@ -266,20 +266,24 @@ def _is_real_name(name: str) -> bool:
 
 def _extract_authority(vf: VendorFiles,
                        sl_authority_files: list[str] = None,
-                       unread: list = None) -> str:
+                       unread: list = None,
+                       directors: list[str] = None) -> str:
     """
     ดึงรายชื่อผู้มีอำนาจควบคุมจากไฟล์ที่ submitList ระบุไว้เท่านั้น
 
-    Rule (จาก user req):
+    Rule:
       - ใช้เฉพาะไฟล์ใน submitList หมวด "ผู้มีอำนาจควบคุม"
-      - ไม่ใช้ "กรรมการซึ่งลงชื่อผูกพัน" (เป็นผู้มีอำนาจลงนาม ไม่ใช่ผู้มีอำนาจควบคุม)
-      - ไม่ใช้ directors เป็น fallback
-      - ถ้าไม่มีไฟล์ → "-"
+      - ไม่ใช้ "กรรมการซึ่งลงชื่อผูกพัน" (= ผู้มีอำนาจลงนาม คนละหมวด)
+      - ถ้าไม่มีไฟล์ใน submitList → "-"
+      - ถ้ามีไฟล์ใน submitList แต่อ่านไม่ออก (scanned)
+        + บริษัทมีกรรมการคนเดียว → ใช้คนนั้น (1-director default)
+        + บริษัทมีกรรมการหลายคน → "-" (รอ OCR)
     """
     if not sl_authority_files:
         return "-"
 
     names: list[str] = []
+    file_was_read = False
     for fname in sl_authority_files:
         p = find_by_original(vf, fname)
         if not p:
@@ -287,6 +291,7 @@ def _extract_authority(vf: VendorFiles,
         t = _read(p, unread=unread, label="ผู้มีอำนาจควบคุม")
         if not t:
             continue
+        file_was_read = True
         # หา section ผู้มีอำนาจ ในไฟล์
         block = t
         section_m = re.search(
@@ -319,6 +324,11 @@ def _extract_authority(vf: VendorFiles,
                 names.append(name)
         if names:
             break  # เจอชื่อแล้ว ไม่ต้องดูไฟล์อื่น
+
+    # fallback: ไฟล์ submitList ระบุไว้ + บริษัทกรรมการคนเดียว → ใช้คนนั้น
+    # (case ไตรยูนิตี้ — authority file scanned แต่ user เอา director = authority)
+    if not names and directors and len(directors) == 1:
+        return f"1. {directors[0]}"
 
     if not names:
         return "-"
@@ -580,6 +590,7 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
         vf,
         sl_authority_files=sl_get_files(sl, "authority_doc"),
         unread=d.unread_files,
+        directors=d.directors,
     )
 
     # ── 2. ผู้ถือหุ้น >25% ──────────────────────────────────────────────────
@@ -603,8 +614,8 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
         holders = find_shareholder_over(sh_text, threshold=25.0, tables=sh_tables)
         if holders:
             has_major_holder = True
-            lines = [f"{n} ({p:.2f}%)" for n, p in holders]
-            d.shareholders = "\n".join(lines) + f"\n(วิเคราะห์ >25% จาก {sh_source})"
+            # แสดงแค่ "ชื่อ (%)" ไม่ใส่ source suffix (per user)
+            d.shareholders = "\n".join(f"{n} ({p:.2f}%)" for n, p in holders)
 
     # ── 3. มูลค่าสุทธิ ──────────────────────────────────────────────────────
     fin_path = None
