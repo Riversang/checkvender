@@ -135,14 +135,37 @@ def list_files(vf: VendorFiles) -> list[tuple[str, str]]:
 def find_by_original(vf: VendorFiles, original_name: str) -> Optional[str]:
     """
     หา file path จากชื่อ original (basename) ที่ระบุใน submitList
-    รองรับ fuzzy match (เผื่อชื่อใน submitList ตัด space ผิด)
+    รองรับ fuzzy match:
+      - submitList ระบุ "X.pdf" แต่ไฟล์จริงเป็น "X_<hash>.pdf"
+      - มี space ต่างกัน
     """
-    target = re.sub(r"\s+", "", original_name).lower()
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", "", s).lower()
+
+    def _stem(s: str) -> str:
+        # ตัด extension + ตัด hash suffix แบบ "_<hex>"
+        base = os.path.splitext(s)[0]
+        # ตัด trailing "_<hex chars>" ที่ระบบ e-GP เพิ่ม
+        base = re.sub(r"_[0-9a-f]{8,}(?:_\d+_sys)?$", "", base, flags=re.IGNORECASE)
+        return _norm(base)
+
+    target_full = _norm(original_name)
+    target_stem = _stem(original_name)
+
+    # 1. exact match (full filename รวม .pdf)
     for safe, orig in vf.original_names.items():
-        if re.sub(r"\s+", "", orig).lower() == target:
+        if _norm(orig) == target_full:
             return os.path.join(vf.extract_dir, safe)
-    # fallback: substring match
+    # 2. stem match (ตัด hash suffix และ extension)
     for safe, orig in vf.original_names.items():
-        if target in re.sub(r"\s+", "", orig).lower():
+        if _stem(orig) == target_stem:
+            return os.path.join(vf.extract_dir, safe)
+    # 3. substring (full)
+    for safe, orig in vf.original_names.items():
+        if target_full in _norm(orig):
+            return os.path.join(vf.extract_dir, safe)
+    # 4. substring (stem)
+    for safe, orig in vf.original_names.items():
+        if target_stem and target_stem in _stem(orig):
             return os.path.join(vf.extract_dir, safe)
     return None

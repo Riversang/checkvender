@@ -101,6 +101,9 @@ TESSERACT_MAX_PAGES = 8        # อ่าน OCR สูงสุด 8 หน้
 
 _THAI_CHAR_RE = re.compile(r"[ก-๛]")
 _GARBLED_CHARS_RE = re.compile(r"[+#%&*|<>~`@^]")
+# Latin Extended chars ที่มัก override Thai glyphs ใน font subset
+# (เช่น เลĂทัด, ýุภดิลก, บริþัท)
+_LATIN_EXT_RE = re.compile(r"[À-ÿĀ-žƀ-ɏ]")
 _COMMON_THAI_WORDS = (
     "บริษัท", "หจก", "ห้าง", "นาย", "นาง", "หุ้น", "กรรมการ",
     "ทะเบียน", "เลข", "ผู้", "ที่", "ใน", "การ", "ของ", "และ",
@@ -133,6 +136,11 @@ def _quality_ok(text: str) -> bool:
     # (เช่น DBD บอจ.5 ที่ใช้ font ฝัง — ออกเป็น '+/)-00 000 %6)-##.+#.')
     garbled = len(_GARBLED_CHARS_RE.findall(text))
     if total > 200 and garbled / total > 0.025:
+        return False
+    # Latin Extended chars แทรกใน Thai → font CMap substitution
+    # (เช่น "บริþัท เซลÿุกิ" หรือ "เลĂทัด ýุภดิลก")
+    latin_ext = len(_LATIN_EXT_RE.findall(text))
+    if total > 200 and latin_ext / total > 0.02:
         return False
     return True
 

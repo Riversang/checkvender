@@ -119,7 +119,7 @@ _NAME_PATTERNS = [
     # full line standalone
     r"^(บริษัท\s+[^\n]+?\s+จำกัด(?:\s*\(มหาชน\))?)\s*$",
     # ห้างหุ้นส่วน
-    r"(ห้างหุ้นส่วน[จำกัด|สามัญ][^\n]+)",
+    r"(ห้างหุ้นส่วน(?:จำกัด|สามัญ)[^\n]+?(?:จำกัด|$))",
 ]
 
 
@@ -159,13 +159,16 @@ _DIR_TITLE_RE = re.compile(
 
 
 def _extract_directors(text: str) -> list[str]:
-    """ดึงรายชื่อกรรมการจาก juristic_information"""
+    """ดึงรายชื่อกรรมการจาก juristic_information / หนังสือจดทะเบียน"""
     if not text:
         return []
     # block "รายชื่อกรรมการ" → "กรรมการซึ่งลงชื่อ" หรืออื่นๆ
     patterns = [
         r"รายชื่อกรรมการ\s+([\s\S]+?)(?:กรรมการซึ่งลงชื่อ|ข้อจำกัด|รายชื่อผู้|จำนวนกรรมการ\s+\d)",
         r"กรรมการ(?:บริษัท)?\s*[:：]\s*([\s\S]+?)(?:ข้อจำกัด|ลายมือชื่อ|ผู้มีอำนาจ)",
+        # garbled-font variant: "รายชื่ĂดังตĂไปนี้" / "ตามรายชื่อดังต่อไปนี้"
+        r"ตามรายชื่[^\s]{1,3}ดังต[^\s]{1,3}ไปนี้\s+([\s\S]+?)"
+        r"(?:กรรมการ(?:ขĂง|ของ).+?ลง|ข้อจำกัด|จำนวนผู้ถือหุ้น|\Z)",
     ]
     for pat in patterns:
         m = re.search(pat, text)
@@ -180,14 +183,35 @@ def _extract_directors(text: str) -> list[str]:
             if not ln:
                 continue
             if _DIR_TITLE_RE.match(ln):
-                # ตัดข้อความหลังจุด/comma
                 ln = re.split(r"[,/]", ln)[0].strip()
-                # ตัด trailing คำว่า "และ ..." ถ้ามี
                 ln = re.sub(r"\s+และ\s+.*$", "", ln).strip()
                 if ln and ln not in dirs:
                     dirs.append(ln)
         if dirs:
             return dirs[:20]
+
+    # fallback (เผื่อ font subset): scan whole text สำหรับ pattern
+    # "<n>. นาย/นาง/น.ส.<name> <lastname>" — title อาจติดชื่อ
+    # รองรับ multi-column layout (เช่น "1. นายA B 2. นายC D" ในบรรทัดเดียว)
+    # → ไม่ใช้ ^ anchor + จำกัด 2 tokens (firstname + lastname)
+    dirs2: list[str] = []
+    for m2 in re.finditer(
+        r"\d+[\.\)]\s+((?:นาย|นาง|น\.ส\.|นางสาว|Mr\.?|Mrs\.?)"
+        r"\s*\S+\s+\S+)",                 # title + firstname + lastname only
+        text,
+    ):
+        name = re.sub(r"\s+", " ", m2.group(1)).strip()
+        # ตัด trailing ตัวเลขลำดับที่หลุดมา (เช่น "นายA B 2.")
+        name = re.sub(r"\s+\d+[\.\)]\s*$", "", name).strip()
+        # ตัด trailing คำเชื่อม
+        name = re.split(
+            r"\s+(?:และ|หรือ|ลง|ที่|ซึ่ง|รับรอง|รวม)\b",
+            name, maxsplit=1,
+        )[0].strip()
+        if name and name not in dirs2:
+            dirs2.append(name)
+    if len(dirs2) >= 2:
+        return dirs2[:20]
     return []
 
 
@@ -311,6 +335,10 @@ def _extract_authority(vf: VendorFiles, info_text: str = "",
     if not names and use_all_dirs and directors:
         return "\n".join(f"{i+1}. {n}" for i, n in enumerate(directors[:10])) \
                + "\n(กรรมการลงลายมือชื่อร่วมกัน)"
+
+    # 4. fallback: บริษัทกรรมการคนเดียว → director นั้นคือ authority
+    if not names and directors and len(directors) == 1:
+        return f"1. {directors[0]}"
 
     if not names:
         return "-"
@@ -484,24 +512,41 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
     sl = parse_submitlist(vf.submitlist_path) if vf.submitlist_path else SubmitList()
 
     # ── 1. ชื่อบริษัท / กรรมการ / authority ─────────────────────────────────
+    # อ่านไฟล์ cert จาก submitList แล้ว pick ตัวที่ extract directors ได้มากสุด
+    # (กัน OBJMGR/Objective ซึ่งเป็นไฟล์วัตถุประสงค์ ไม่ใช่ทะเบียนนิติบุคคล)
     info_text = ""
-    # ลองอ่านจากไฟล์ที่ submitList ระบุก่อน (แม่นที่สุด)
+    cert_candidates: list[tuple[str, str]] = []  # (label, text)
     for fname in sl_get_files(sl, "cert"):
         p = find_by_original(vf, fname)
         if p:
             t = _read(p)
-            if t and len(t) > len(info_text):
-                info_text = t  # เก็บ text ยาวสุดไว้
+            if t:
+                cert_candidates.append((fname, t))
 
     # fallback: หา juristic_information แบบ keyword
-    if not info_text:
+    if not cert_candidates:
         p = find_file(vf, "juristic_information")
         if p:
-            info_text = _read(p)
+            cert_candidates.append(("juristic_information", _read(p)))
+
+    # เลือกไฟล์ที่ extract directors ได้
+    best_dirs: list[str] = []
+    for label, t in cert_candidates:
+        # skip OBJMGR/Objective — เป็นไฟล์วัตถุประสงค์ ไม่ใช่ทะเบียนกรรมการ
+        if re.search(r"objmgr|objective|วัตถุประสงค์", label, re.IGNORECASE):
+            continue
+        dirs = _extract_directors(t)
+        if len(dirs) > len(best_dirs):
+            best_dirs = dirs
+            info_text = t
+
+    # ถ้ายังไม่เจอ → ใช้ตัวยาวที่สุด (เผื่อ extract directors ไม่ได้แต่ยังได้ชื่อ)
+    if not info_text and cert_candidates:
+        info_text = max(cert_candidates, key=lambda x: len(x[1]))[1]
 
     if info_text:
         d.name = _extract_company_name(info_text)
-        d.directors = _extract_directors(info_text)
+        d.directors = best_dirs or _extract_directors(info_text)
 
     # fallback ชื่อบริษัท — ลองหลายแหล่งตามลำดับความน่าเชื่อถือ
     fallback_sources: list[tuple[str, str]] = []
