@@ -214,12 +214,15 @@ def _extract_directors(text: str) -> list[str]:
     # รองรับ multi-column layout (เช่น "1. นายA B 2. นายC D" ในบรรทัดเดียว)
     dirs2: list[str] = []
     for m2 in re.finditer(
-        r"\d+[\.\)]\s+(" + _TITLE_ALT + r"\s*\S+\s+\S+)",
+        # รองรับทั้งเลขอาหรับและเลขไทย
+        r"[\d๐-๙]+\s*[\.\),:]\s*(" + _TITLE_ALT + r"\s*\S+\s+\S+)",
         text,
     ):
         name = re.sub(r"\s+", " ", m2.group(1)).strip()
-        # ตัด trailing ตัวเลขลำดับ
-        name = re.sub(r"\s+\d+[\.\)]\s*$", "", name).strip()
+        # ตัด trailing เลขลำดับ
+        name = re.sub(r"\s+[\d๐-๙]+[\.\)]\s*$", "", name).strip()
+        # ตัด trailing "เลขประจำตัวประชาชน..."
+        name = re.split(r"เลข(?:ประจำ|ประจํา|ที่|ประชาชน|บัตร)", name, maxsplit=1)[0].strip()
         # ตัด trailing คำเชื่อม
         name = re.split(
             r"\s+(?:และ|หรือ|ลง|ที่|ซึ่ง|รับรอง|รวม)\b",
@@ -295,11 +298,25 @@ def _extract_authority(vf: VendorFiles,
       - ถ้าไม่มีไฟล์ใน submitList → "-"
       - ถ้ามีไฟล์แต่อ่านไม่ออก → "-" (มี warning ในหมายเหตุให้ user OCR เอง)
     """
-    if not sl_authority_files:
+    # Fallback: ถ้า submitList ไม่มี → scan ไฟล์ใน ZIP ที่ชื่อมี "ผู้มีอำนาจ"/"ควบคุม"
+    files_to_check = list(sl_authority_files or [])
+    if not files_to_check:
+        for safe, orig in vf.original_names.items():
+            low_orig = orig.lower()
+            if ("ผู้มีอำนาจ" in orig or "ผู้มีอำนาจ" in orig
+                    or "ควบคุม" in orig
+                    or "authority" in low_orig
+                    or "controlling" in low_orig):
+                # skip files ที่เป็น "ผู้มีอำนาจลงนาม" (signatory) — คนละหมวด
+                if "ลงนาม" in orig and "ควบคุม" not in orig:
+                    continue
+                files_to_check.append(orig)
+
+    if not files_to_check:
         return "-"
 
     names: list[str] = []
-    for fname in sl_authority_files:
+    for fname in files_to_check:
         p = find_by_original(vf, fname)
         if not p:
             continue
@@ -330,15 +347,18 @@ def _extract_authority(vf: VendorFiles,
         # ขยาย char limit สูงขึ้น — กรณี OCR รวม first+last เป็นคำเดียว
         # (เช่น "นายธารินทร์จงประเจิด" = 20 chars, "นางชัยลดาตันติเวชกุล" = 20 chars)
         for nm in re.finditer(
-            r"\d+[\.\)]\s+(" + _TITLE_ALT +
-            r"\s*[ก-๛]{2,40}"            # ขยายเป็น 40 รองรับชื่อยาวที่ติดกัน
+            # numbered prefix: รองรับทั้งเลขอาหรับ (1.2.3) และเลขไทย (๑.๒.๓)
+            r"[\d๐-๙]+\s*[\.\),:]\s*(" + _TITLE_ALT +
+            r"\s*[ก-๛]{2,40}"
             r"(?:\s+(?!และ|หรือ|กับ|พร้อม|ลง|ที่|ซึ่ง|รับรอง|รวม|มี|ใน|ทั้ง|ขอ|ลายมือ"
-            r"|กรรมการ|ประทับ|ลายมือชื่อ|ตา|คนใด|คนหนึ่ง|สำคัญ)"
-            r"[ก-๛]{1,40}){0,3}"        # last name (+optional middle), max 3 tokens
+            r"|กรรมการ|ประทับ|ลายมือชื่อ|ตา|คนใด|คนหนึ่ง|สำคัญ|เลข|ประจำ|ประชาชน)"
+            r"[ก-๛]{1,40}){0,3}"
             r")",
             block,
         ):
             name = re.sub(r"\s+", " ", nm.group(1)).strip()
+            # ตัด trailing "เลข..." (ส่วน "เลขประจำตัวประชาชน...")
+            name = re.split(r"เลข(?:ประจำ|ประจํา|ที่|ประชาชน|บัตร)", name, maxsplit=1)[0].strip()
             name = re.split(
                 r"\s+(?:และ|หรือ|กับ|พร้อม|ที่|ซึ่ง|ลง|ตา|รับรอง|มี|ใน|รวม|ทั้ง|ขอ|ลายมือ)",
                 name, maxsplit=1,
@@ -649,8 +669,11 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
     )
 
     # ── 2. ผู้ถือหุ้น >25% ──────────────────────────────────────────────────
+    # ลำดับ:
+    #   1. ไฟล์ที่ submitList ระบุในหมวด "ผู้ถือหุ้นรายใหญ่"
+    #   2. ถ้าไม่มี → ค้น keyword "ผู้ถือหุ้น" / "shareholder" / "บอจ5"
     sh_path = None
-    sh_source = ""   # "สารบัญ" หรือ "shareholder file"
+    sh_source = ""
     for fname in sl_get_files(sl, "shareholder_doc"):
         p = find_by_original(vf, fname)
         if p:
@@ -658,9 +681,12 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
             sh_source = "สารบัญ submitList"
             break
     if not sh_path:
-        sh_path = find_file(vf, "shareholder")
-        if sh_path:
-            sh_source = "shareholder file"
+        # fallback: ค้น keyword ในไฟล์
+        for kw in ("ผู้ถือหุ้น", "shareholder", "บอจ5", "บอจ.5"):
+            sh_path = find_file(vf, kw)
+            if sh_path:
+                sh_source = f"ค้นจาก keyword '{kw}'"
+                break
 
     has_major_holder = False   # ใช้ตัดสิน ✓/- ใน Section 1 col "ผู้ถือหุ้นรายใหญ่"
     if sh_path:
