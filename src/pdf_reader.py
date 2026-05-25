@@ -186,6 +186,24 @@ def _read_pymupdf(path: str) -> str:
 
 # ─── ชั้นที่ 3: Tesseract OCR (ฟรี, ใช้ได้ local) ────────────────────────────
 
+def _post_ocr_thai(text: str) -> str:
+    """
+    หลัง Tesseract OCR: รวมตัวอักษรไทยที่ถูกแยกด้วย space
+    (Tesseract มัก output "ก ร ม พ ั ฒ น า" แทน "กรมพัฒนา")
+
+    กฎ:
+      - ถ้า Thai char ถูก space แยกจาก Thai char ตัวอื่น → รวม (ลบ space)
+      - คง space ระหว่าง Thai-Eng/digit, Eng-Eng
+    """
+    # ลบ space ระหว่าง Thai char สองตัว (รวมถึงตัวที่เป็น vowel/tone)
+    # pattern: <thai><spaces><thai> → <thai><thai>
+    pattern = re.compile(r"([ก-๛])\s+(?=[ก-๛])")
+    # apply ซ้ำเพราะ space ติดกันหลาย ๆ
+    for _ in range(3):
+        text = pattern.sub(r"\1", text)
+    return text
+
+
 def _read_tesseract(path: str) -> str:
     """
     OCR ด้วย Tesseract (ฟรี local) — ใช้กับ PDF ภาพสแกน + font ฝังที่อ่านไม่ออก
@@ -211,6 +229,8 @@ def _read_tesseract(path: str) -> str:
             except pytesseract.TesseractError:
                 # fallback: ใช้แค่ eng ถ้าไม่มี tha pack
                 t = pytesseract.image_to_string(img, lang="eng")
+            # post-process รวมตัวอักษรไทยที่ถูก space แยก
+            t = _post_ocr_thai(t)
             texts.append(t)
         doc.close()
         return "\n".join(texts).strip()

@@ -199,7 +199,8 @@ def _extract_directors(text: str) -> list[str]:
             if _DIR_TITLE_RE.match(ln):
                 ln = re.split(r"[,/]", ln)[0].strip()
                 ln = re.sub(r"\s+และ\s+.*$", "", ln).strip()
-                if ln and ln not in dirs:
+                # validate: ไม่ใช่ "นายทะเบียน", "นายหน้า" ฯลฯ
+                if ln and _is_real_name(ln) and ln not in dirs:
                     dirs.append(ln)
         if dirs:
             return dirs[:20]
@@ -207,24 +208,24 @@ def _extract_directors(text: str) -> list[str]:
     # fallback (เผื่อ font subset): scan whole text สำหรับ pattern
     # "<n>. นาย/นาง/น.ส.<name> <lastname>" — title อาจติดชื่อ
     # รองรับ multi-column layout (เช่น "1. นายA B 2. นายC D" ในบรรทัดเดียว)
-    # → ไม่ใช้ ^ anchor + จำกัด 2 tokens (firstname + lastname)
     dirs2: list[str] = []
     for m2 in re.finditer(
         r"\d+[\.\)]\s+((?:นาย|นาง|น\.ส\.|นางสาว|Mr\.?|Mrs\.?)"
-        r"\s*\S+\s+\S+)",                 # title + firstname + lastname only
+        r"\s*\S+\s+\S+)",
         text,
     ):
         name = re.sub(r"\s+", " ", m2.group(1)).strip()
-        # ตัด trailing ตัวเลขลำดับที่หลุดมา (เช่น "นายA B 2.")
+        # ตัด trailing ตัวเลขลำดับ
         name = re.sub(r"\s+\d+[\.\)]\s*$", "", name).strip()
         # ตัด trailing คำเชื่อม
         name = re.split(
             r"\s+(?:และ|หรือ|ลง|ที่|ซึ่ง|รับรอง|รวม)\b",
             name, maxsplit=1,
         )[0].strip()
-        if name and name not in dirs2:
+        # validate: เป็นชื่อคนจริง (ไม่ใช่ นายทะเบียน, นายหน้า ฯลฯ)
+        if name and _is_real_name(name) and name not in dirs2:
             dirs2.append(name)
-    if len(dirs2) >= 2:
+    if len(dirs2) >= 1:
         return dirs2[:20]
     return []
 
@@ -232,33 +233,39 @@ def _extract_directors(text: str) -> list[str]:
 # ─── authority (ผู้มีอำนาจควบคุม) ────────────────────────────────────────────
 
 # คำที่ขึ้นต้นด้วย "นาย/นาง" แต่ไม่ใช่ชื่อคน
+# ห้ามใส่ single chars (เช่น "ก") — จะ match ชื่อจริงที่ขึ้นต้นด้วย ก เช่น "กรวัฒน์"
 _NOT_PERSON_WORDS = {
-    "หน้า", "จ้าง", "ทะเบียน", "ทุน", "ห้าง", "ก", "ข", "ค", "ทาน", "เวร",
-    "ภาษี", "การ", "งาน", "เจตน์", "ภูมิ",
+    "หน้า", "จ้าง", "ทะเบียน", "ทุน", "ห้าง",
+    "ภาษี", "งาน", "เจตน์", "ภูมิ", "เวร",
+    # คำในเอกสารราชการ
+    "ทะเบียนอาจ", "ทะเบียนได้", "ทะเบียนใน",
+    "หน้าที่",
 }
 
 
 def _is_real_name(name: str) -> bool:
-    """ตรวจว่า 'นายXXX' เป็นชื่อคนจริง (ไม่ใช่คำว่า นายหน้า, นายจ้าง ฯลฯ)"""
+    """ตรวจว่า 'นายXXX' เป็นชื่อคนจริง (ไม่ใช่คำว่า นายหน้า, นายทะเบียน, นายจ้าง ฯลฯ)"""
     if not name or len(name) < 5:
         return False
-    # ต้องมีชื่อ + นามสกุล (อย่างน้อย 2 token)
     tokens = name.split()
-    if len(tokens) < 2:
+    if len(tokens) < 1:
         return False
     title = tokens[0]
     first = tokens[1] if len(tokens) > 1 else ""
-    # ตัดคำนำหน้าออก
+    # ตัดคำนำหน้าออก (กรณีติดกับชื่อ "นายX")
     for t in ("นาย", "นาง", "น.ส.", "นางสาว", "Mr.", "Mr", "Mrs.", "Mrs", "Miss"):
         if title.startswith(t):
             first_after = title[len(t):]
             if first_after:
                 first = first_after
             break
-    # คำหลัง "นาย/นาง" ต้องไม่อยู่ใน stop-list
-    if first in _NOT_PERSON_WORDS:
+    if not first:
         return False
-    # คำต้องเป็นภาษาไทยอย่างน้อย 2 ตัวอักษร
+    # คำหลังคำนำหน้าต้องไม่อยู่ใน stop-list / ไม่ขึ้นต้นด้วยคำใน stop-list
+    for stop in _NOT_PERSON_WORDS:
+        if first == stop or first.startswith(stop):
+            return False
+    # ต้องเป็นภาษาไทยอย่างน้อย 2 ตัวอักษร
     if not re.match(r"^[ก-๛]{2,}", first):
         return False
     return True
