@@ -460,23 +460,50 @@ class App(tk.Tk):
                                    bd=0, relief="flat",
                                    highlightthickness=0,
                                    insertbackground=TEXT)
-        self.ent_output.insert(0, os.path.join(ROOT, "output", "ตรวจเอกสาร.xlsx"))
+        self.ent_output.insert(0, self._default_output_path(""))
         self.ent_output.pack(fill="x", padx=1, pady=1, ipady=9, ipadx=12)
 
+        # ถ้า user แก้เองให้ไม่ auto-update อีก
+        self._user_edited_output = False
         def _out_fin(_):
             ent_wrap.configure(bg=ACCENT)
-
         def _out_fout(_):
             ent_wrap.configure(bg=BORDER)
-
+        def _out_changed(_):
+            self._user_edited_output = True
         self.ent_output.bind("<FocusIn>", _out_fin)
         self.ent_output.bind("<FocusOut>", _out_fout)
+        self.ent_output.bind("<Key>", _out_changed)
+
+        # Auto-update output filename เมื่อ user พิมพ์ชื่อโครงการ
+        def _project_changed(_=None):
+            if self._user_edited_output:
+                return
+            new = self._default_output_path(self.ent_project.get().strip())
+            self.ent_output.delete(0, "end")
+            self.ent_output.insert(0, new)
+        self.ent_project.bind("<KeyRelease>", _project_changed)
 
         self._btn(out_row, "เลือกที่บันทึก", self._pick_output,
                   style="ghost").pack(side="left", padx=(10, 0))
 
         # Ensure canvas scrolls to top after all widgets are rendered
         self.after(100, lambda: _canvas.yview_moveto(0))
+
+    def _default_output_path(self, project: str) -> str:
+        """สร้าง path output อัตโนมัติ — ใช้ชื่อโครงการ + วันที่กันชนกัน"""
+        import datetime, re
+        # ตัด chars ที่ Windows ห้ามใช้ในชื่อไฟล์ (<, >, :, ", /, \, |, ?, *)
+        # เก็บ Thai chars ทั้งหมด + alphanumeric + space _ - ( )
+        safe = re.sub(r'[<>:"/\\|?*]', "", project).strip()
+        safe = safe[:50].strip()
+        if not safe:
+            safe = "ตรวจเอกสาร"
+        else:
+            safe = f"ตรวจเอกสาร_{safe}"
+        # เพิ่ม date stamp
+        date = datetime.datetime.now().strftime("%Y%m%d")
+        return os.path.join(ROOT, "output", f"{safe}_{date}.xlsx")
 
     # ── Actions ───────────────────────────────────────────────────────────────
     def _update_zip_count(self):
@@ -517,10 +544,25 @@ class App(tk.Tk):
             defaultextension=".xlsx",
             filetypes=[("Excel", "*.xlsx")],
             initialdir=os.path.join(ROOT, "output"),
+            initialfile=os.path.basename(self.ent_output.get() or "ตรวจเอกสาร.xlsx"),
         )
         if f:
             self.ent_output.delete(0, "end")
             self.ent_output.insert(0, f)
+            self._user_edited_output = True
+
+    @staticmethod
+    def _unique_path(path: str) -> str:
+        """ถ้าไฟล์มีอยู่แล้ว เพิ่ม _2, _3 ท้าย เพื่อกันทับ"""
+        if not os.path.exists(path):
+            return path
+        base, ext = os.path.splitext(path)
+        i = 2
+        while True:
+            cand = f"{base}_{i}{ext}"
+            if not os.path.exists(cand):
+                return cand
+            i += 1
 
     def _log(self, msg: str, tag: str = ""):
         self.log.configure(state="normal")
@@ -551,6 +593,8 @@ class App(tk.Tk):
         if not output:
             messagebox.showerror("ข้อผิดพลาด", "กรุณาระบุที่บันทึกไฟล์ Excel")
             return
+        # กันชนกัน — ถ้าไฟล์ชื่อนี้มีอยู่แล้ว เพิ่ม _2, _3 ท้าย
+        output = self._unique_path(output)
 
         self.btn_run.configure(state="disabled", text="⏳  กำลังประมวลผล...")
         self._set_status("กำลังประมวลผล", "running")

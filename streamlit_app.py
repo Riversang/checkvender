@@ -234,12 +234,18 @@ if st.button("▶ ตรวจเอกสาร", type="primary", use_container
     } for v in sorted(vendors, key=lambda x: x.price)])
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-    # Download button
-    safe_name = "".join(c for c in project if c.isalnum() or c in " _-")[:40]
+    # Download button — ใส่ชื่อโครงการ + วันที่ + เวลา กันชนกันแน่นอน
+    import datetime, re
+    safe_name = re.sub(r'[<>:"/\\|?*]', "", project).strip()[:50].strip()
+    if not safe_name:
+        safe_name = "ตรวจเอกสาร"
+    else:
+        safe_name = f"ตรวจเอกสาร_{safe_name}"
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
     st.download_button(
         label="⬇ ดาวน์โหลด Excel",
         data=excel_bytes,
-        file_name=f"ตรวจเอกสาร_{safe_name}.xlsx",
+        file_name=f"{safe_name}_{stamp}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )

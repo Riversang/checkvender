@@ -88,9 +88,24 @@ def resolve_zips(patterns: list[str]) -> list[str]:
 
 
 def default_output(project: str) -> str:
-    # ตัดอักขระพิเศษออก ใช้เป็นชื่อไฟล์
-    safe = "".join(c for c in project if c.isalnum() or c in " _()-")[:40].strip()
-    return os.path.join("output", f"ตรวจเอกสาร_{safe}.xlsx")
+    # ตัด chars ที่ Windows ห้ามใช้ในชื่อไฟล์
+    import re
+    safe = re.sub(r'[<>:"/\\|?*]', "", project).strip()[:50].strip()
+    if not safe:
+        safe = "ตรวจเอกสาร"
+    else:
+        safe = f"ตรวจเอกสาร_{safe}"
+    import datetime
+    date = datetime.datetime.now().strftime("%Y%m%d")
+    base = os.path.join("output", f"{safe}_{date}.xlsx")
+    # กันชนกัน
+    if not os.path.exists(base):
+        return base
+    stem, ext = os.path.splitext(base)
+    i = 2
+    while os.path.exists(f"{stem}_{i}{ext}"):
+        i += 1
+    return f"{stem}_{i}{ext}"
 
 
 def main():
