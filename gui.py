@@ -5,6 +5,7 @@ gui.py — หน้าต่างโปรแกรมตรวจเอกส
 """
 import os
 import sys
+import glob
 import math
 import threading
 import subprocess
@@ -13,7 +14,41 @@ from tkinter import ttk, filedialog, messagebox
 
 # ── ชี้ไปที่ project root ────────────────────────────────────────────────────
 ROOT = os.path.dirname(os.path.abspath(__file__))
-PYTHON = sys.executable
+
+
+def _find_python() -> str:
+    """
+    หา python.exe ที่มี dependencies ครบ (openpyxl ฯลฯ)
+
+    ลำดับ:
+      1. WinPython บน drive เดียวกับ project (portable, มี packages พร้อม)
+      2. sys.executable (Python ที่รัน gui.py อยู่)
+
+    ป้องกันกรณีที่เครื่องมี Python หลายตัว แล้ว gui.py โดน launch จาก
+    Python ที่ไม่ได้ install dependencies
+    """
+    drive = os.path.splitdrive(ROOT)[0]
+    if drive:
+        # ลองหา WinPython บน drive เดียวกัน
+        candidates = glob.glob(
+            os.path.join(drive + os.sep, "WinPython", "**", "python.exe"),
+            recursive=True,
+        )
+        # เช็คว่าตัวไหนมี openpyxl
+        for p in candidates:
+            try:
+                r = subprocess.run(
+                    [p, "-c", "import openpyxl"],
+                    capture_output=True, timeout=5,
+                )
+                if r.returncode == 0:
+                    return p
+            except (subprocess.TimeoutExpired, OSError):
+                continue
+    return sys.executable
+
+
+PYTHON = _find_python()
 
 # ── สี / ฟอนต์ (Soft Navy palette) ──────────────────────────────────────────
 BG          = "#EEF2F7"   # soft blue-gray canvas
