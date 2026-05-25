@@ -85,7 +85,7 @@ class VendorData:
 def _read(path: Optional[str]) -> str:
     if not path or not os.path.exists(path):
         return ""
-    text, _ = read_pdf_text(path, use_vision=False)
+    text, _ = read_pdf_text(path, use_vision=True)
     return text
 
 
