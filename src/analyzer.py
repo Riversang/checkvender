@@ -604,6 +604,33 @@ def _any_match(text: str, patterns: list[str]) -> bool:
     return False
 
 
+def _check_section2(sl_files: list[str], zip_files: list[str],
+                    patterns: list[str],
+                    negative_patterns: list[str] = None) -> tuple[str, str]:
+    """
+    ตัดสิน ✓/- สำหรับคอลัมน์ Section 2 — อ้าง submitList ก่อนเสมอ
+
+    Logic:
+      1. ถ้า submitList ส่วนที่ 2 มี file ที่ match pattern → ✓ (source = submitList)
+      2. ถ้า submitList ส่วนที่ 2 ไม่มี match แต่มีไฟล์ระบุไว้บ้าง → "-"
+         (vendor ไม่ได้ยื่นเอกสารหมวดนี้ตาม submitList)
+      3. ถ้า submitList Section 2 ว่างเลย (parser ล้มเหลว / project ไม่มี Section 2)
+         → fallback เช็คใน ZIP scan (relaxed)
+
+    Returns:
+        (status, source)  เช่น ("✓", "submitList") หรือ ("-", "")
+    """
+    if sl_files:
+        # มีข้อมูล Section 2 จาก submitList — ใช้เป็น primary
+        if _has_in_files(sl_files, patterns, negative_patterns):
+            return "✓", "submitList"
+        return "-", ""
+    # fallback: ไม่มี Section 2 ใน submitList → scan ZIP
+    if _has_in_files(zip_files, patterns, negative_patterns):
+        return "✓", "ZIP scan (no submitList)"
+    return "-", ""
+
+
 def _has_in_files(file_list: list[str], patterns: list[str],
                   negative_patterns: list[str] = None) -> bool:
     """
@@ -802,17 +829,22 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
     if q_path:
         d.price = _extract_price(_read(q_path), budget=budget)
 
-    # ── 5. ส่วนที่ 1: ใช้ submitList ────────────────────────────────────────
+    # ── 5. ส่วนที่ 1: ตรวจ ✓/- ───────────────────────────────────────────────
+    # ★ RULE: อ้างอิง submitList ส่วนที่ 1 ก่อนเสมอ
+    #   ★ row N ของ submitList = แต่ละคอลัมน์ใน Excel ส่วนที่ 1
+    #     ✓ = submitList row N มีไฟล์ระบุไว้ (vendor ยื่นเอกสารหมวดนี้)
+    #     - = row N ว่าง / "ไม่มีเอกสารแนบ"
+    #   ZIP scan = fallback เฉพาะกรณี submitList parse ไม่ได้
     if sl.parsed_ok:
-        d.cert            = CHECK if sl_has_doc(sl, "cert")            else DASH
-        d.memo            = CHECK if sl_has_doc(sl, "memo")            else DASH
-        d.director_list   = CHECK if sl_has_doc(sl, "director_list")   else DASH
-        d.authority_doc   = CHECK if sl_has_doc(sl, "authority_doc")   else DASH
-        d.credit          = CHECK if sl_has_doc(sl, "credit")          else DASH
-        d.trade_reg       = CHECK if sl_has_doc(sl, "trade_reg")       else DASH
-        d.vat             = CHECK if sl_has_doc(sl, "vat")             else DASH
+        d.cert            = CHECK if sl_has_doc(sl, "cert")            else DASH  # row 1
+        d.memo            = CHECK if sl_has_doc(sl, "memo")            else DASH  # row 2
+        d.director_list   = CHECK if sl_has_doc(sl, "director_list")   else DASH  # row 3
+        d.authority_doc   = CHECK if sl_has_doc(sl, "authority_doc")   else DASH  # row 5
+        d.credit          = CHECK if sl_has_doc(sl, "credit")          else DASH  # row 8
+        d.trade_reg       = CHECK if sl_has_doc(sl, "trade_reg")       else DASH  # row 9
+        d.vat             = CHECK if sl_has_doc(sl, "vat")             else DASH  # row 10
     else:
-        # fallback: เดาจากไฟล์
+        # ⚠ fallback เฉพาะเมื่อ submitList parse ไม่ได้ — เดาจากชื่อไฟล์
         d.cert            = CHECK if find_file(vf, "juristic_information") else DASH
         d.memo            = CHECK if (find_file(vf, "juristic_document")
                                        or find_file(vf, "MEMIMG")
@@ -830,19 +862,25 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
     # (ไม่ใช่แค่ยื่นไฟล์ shareholder)
     d.shareholder_doc = CHECK if has_major_holder else DASH
 
-    # ── 6. ส่วนที่ 2: filename pattern matching ─────────────────────────────
-    candidates = _collect_part2_candidates(sl, vf)
+    # ── 6. ส่วนที่ 2: ตรวจ ✓/- ───────────────────────────────────────────────
+    # ★ RULE: อ้างอิง submitList ส่วนที่ 2 ก่อนเสมอ
+    #   - ถ้า submitList ระบุไฟล์ตรง pattern → ✓
+    #   - ถ้า submitList ระบุไฟล์ แต่ไม่มีไฟล์ตรง pattern → "-"
+    #     (vendor ไม่ได้ยื่นเอกสารหมวดนี้ตามสารบัญ)
+    #   - ถ้า submitList Section 2 ว่าง (parser ล้มเหลว) → fallback scan ZIP
+    sl_part2 = list(sl.part2_files)            # ★ files จาก submitList Section 2
+    zip_extras = _collect_part2_candidates(sl, vf)   # submitList + ZIP scan รวม
 
-    d.catalogue    = CHECK if _has_in_files(candidates, _CATALOGUE_PATTERNS) else DASH
-    d.line_license = CHECK if _has_in_files(candidates, _LINE_PATTERNS,
-                                             _LINE_NEGATIVE_PATTERNS)         else DASH
-    d.sme          = CHECK if _has_in_files(candidates, _SME_PATTERNS)       else DASH
-    d.mit          = CHECK if _has_in_files(candidates, _MIT_PATTERNS)       else DASH
-    d.work_cert    = CHECK if _has_in_files(candidates, _WORK_CERT_PATTERNS) else DASH
-    d.poa          = CHECK if _has_in_files(candidates, _POA_PATTERNS)       else DASH
-    d.guarantee    = CHECK if _has_in_files(candidates, _GUARANTEE_PATTERNS) else DASH
-    d.personnel    = CHECK if _has_in_files(candidates, _PERSONNEL_PATTERNS) else DASH
-    d.project_mgmt = CHECK if _has_in_files(candidates, _MGMT_PATTERNS)      else DASH
+    d.catalogue,    _ = _check_section2(sl_part2, zip_extras, _CATALOGUE_PATTERNS)
+    d.line_license, _ = _check_section2(sl_part2, zip_extras, _LINE_PATTERNS,
+                                          _LINE_NEGATIVE_PATTERNS)
+    d.sme,          _ = _check_section2(sl_part2, zip_extras, _SME_PATTERNS)
+    d.mit,          _ = _check_section2(sl_part2, zip_extras, _MIT_PATTERNS)
+    d.work_cert,    _ = _check_section2(sl_part2, zip_extras, _WORK_CERT_PATTERNS)
+    d.poa,          _ = _check_section2(sl_part2, zip_extras, _POA_PATTERNS)
+    d.guarantee,    _ = _check_section2(sl_part2, zip_extras, _GUARANTEE_PATTERNS)
+    d.personnel,    _ = _check_section2(sl_part2, zip_extras, _PERSONNEL_PATTERNS)
+    d.project_mgmt, _ = _check_section2(sl_part2, zip_extras, _MGMT_PATTERNS)
 
     # dedupe unread files (เก็บลำดับเดิม)
     if d.unread_files:
