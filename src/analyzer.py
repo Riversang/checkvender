@@ -1,15 +1,33 @@
 """
 analyzer.py — วิเคราะห์เอกสารของผู้ยื่น 1 ราย
 
-ใช้ submitList.pdf เป็น source of truth สำหรับการตรวจ ✓/-
+ใช้ submitList.pdf เป็น source of truth สำหรับ ✓/- ใน Section 1
 (ไม่เดาจากชื่อไฟล์เป็นหลัก เพราะ false positive ง่าย)
 
-content extraction ยังคงใช้ regex/pattern parsing สำหรับ:
-  - ชื่อบริษัท / กรรมการ
-  - ผู้ถือหุ้นรายใหญ่ (>25%) — คำนวณจากจำนวนหุ้น
-  - ผู้มีอำนาจควบคุม
-  - มูลค่าสุทธิ
-  - ราคาเสนอ
+═══════════════════════════════════════════════════════════════════════════
+  SOURCE MAPPING — ตรงตาม submitList ส่วนที่ 1 (10 หมวดมาตรฐาน)
+═══════════════════════════════════════════════════════════════════════════
+  ลำดับ  รายการ                                       → ใช้ดึงข้อมูล
+  ─────  ───────────────────────────────────────────  ─────────────────
+   ๑    สำเนาหนังสือรับรองการจดทะเบียนนิติบุคคล      → DIRECTORS (รายชื่อกรรมการ)
+   ๒    สำเนาหนังสือบริคณห์สนธิ                       → ✓/- เท่านั้น
+   ๓    บัญชีรายชื่อกรรมการผู้จัดการ                  → ✓/- + fallback ชื่อบริษัท
+   ๔    บัญชีผู้ถือหุ้นรายใหญ่                        → SHAREHOLDERS (>25%)
+   ๕    ผู้มีอำนาจควบคุม                              → AUTHORITY (ผู้มีอำนาจควบคุม)
+   ๖    เอกสารแสดงสิทธิ/ประโยชน์                      → ✓/- เท่านั้น
+   ๗    งบแสดงฐานะการเงิน                            → NET WORTH (มูลค่าสุทธิ)
+   ๘    สำเนาหนังสือรับรองวงเงินสินเชื่อ             → ✓/- เท่านั้น
+   ๙    สำเนาใบทะเบียนพาณิชย์                         → ✓/- เท่านั้น
+   ๑๐   สำเนาใบทะเบียนภาษีมูลค่าเพิ่ม (ภพ.20)         → ✓/- เท่านั้น
+
+  หมวด 3 ตัวที่ต้องดึงรายชื่อ — ใช้ไฟล์ในคอลัมน์ "ไฟล์ข้อมูล" ตามลำดับ:
+    DIRECTORS    ← row 1 (cert)
+    SHAREHOLDERS ← row 4 (shareholder_doc)  ถ้าไม่เจอ >25% → "-"
+    AUTHORITY    ← row 5 (authority_doc)    ถ้า row 5 ว่าง → fallback scan filename
+
+  Name prediction (text cleanup):
+    OCR'd authority names → fuzzy-match กับ directors → ใช้ชื่อสะอาด
+═══════════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
 import os
@@ -629,12 +647,13 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
     # ── 0. parse submitList ─────────────────────────────────────────────────
     sl = parse_submitlist(vf.submitlist_path) if vf.submitlist_path else SubmitList()
 
-    # ── 1. ชื่อบริษัท / กรรมการ / authority ─────────────────────────────────
-    # อ่านไฟล์ cert จาก submitList แล้ว pick ตัวที่ extract directors ได้มากสุด
-    # (กัน OBJMGR/Objective ซึ่งเป็นไฟล์วัตถุประสงค์ ไม่ใช่ทะเบียนนิติบุคคล)
+    # ── 1. DIRECTORS (รายชื่อกรรมการ) ───────────────────────────────────────
+    # ★ SOURCE: submitList row 1 "สำเนาหนังสือรับรองการจดทะเบียนนิติบุคคล"
+    # อ่านไฟล์ในคอลัมน์ "ไฟล์ข้อมูล" ของบรรทัดที่ 1 → extract "รายชื่อกรรมการ"
+    # (กัน OBJMGR/Objective — เป็นวัตถุประสงค์ ไม่ใช่ทะเบียนนิติบุคคล)
     info_text = ""
     cert_candidates: list[tuple[str, str]] = []  # (label, text)
-    for fname in sl_get_files(sl, "cert"):
+    for fname in sl_get_files(sl, "cert"):  # ← submitList row 1
         p = find_by_original(vf, fname)
         if p:
             t = _read(p, unread=d.unread_files, label="หนังสือรับรอง")
@@ -713,25 +732,31 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
     if not d.name:
         d.name = _extract_name_from_zip(vf.source_zip)
 
-    # authority — ใช้เฉพาะไฟล์จาก submitList หมวด "ผู้มีอำนาจควบคุม"
-    # (ไม่ใช้ directors เป็น fallback — คนละหมวด)
-    # แต่ส่ง directors เข้าไปเพื่อใช้ "คาดคะเน" ชื่อจาก OCR ที่เพี้ยน
-    # (เช่น OCR ได้ "นางสาวยงยุทธศายลำเพาะ" → fuzzy match กับ directors
-    #  ["น.ส.ยงยุทธ สายลำเพาะ"] → แทนด้วยชื่อสะอาด)
+    # ── 2. AUTHORITY (ผู้มีอำนาจควบคุม) ─────────────────────────────────────
+    # ★ SOURCE: submitList row 5 "ผู้มีอำนาจควบคุม"
+    # ใช้ไฟล์ในคอลัมน์ "ไฟล์ข้อมูล" ของบรรทัดที่ 5 เท่านั้น
+    #   - ไม่ใช้ "กรรมการลงชื่อผูกพัน" (= ผู้มีอำนาจลงนาม คนละหมวด)
+    #   - ไม่ใช้ directors เป็น fallback (กรรมการ ≠ ผู้มีอำนาจควบคุม)
+    # ส่ง directors เพื่อใช้ "คาดคะเน" ชื่อ OCR ที่เพี้ยน
+    #   (เช่น "นางสาวยงยุทธศายลำเพาะ" → fuzzy match กับ directors
+    #    ["น.ส.ยงยุทธ สายลำเพาะ"] → แทนด้วยชื่อสะอาด)
     d.authority = _extract_authority(
         vf,
-        sl_authority_files=sl_get_files(sl, "authority_doc"),
+        sl_authority_files=sl_get_files(sl, "authority_doc"),  # ← submitList row 5
         unread=d.unread_files,
         directors=d.directors,
     )
 
-    # ── 2. ผู้ถือหุ้น >25% ──────────────────────────────────────────────────
+    # ── 3. SHAREHOLDERS (ผู้ถือหุ้นรายใหญ่) ─────────────────────────────────
+    # ★ SOURCE: submitList row 4 "บัญชีผู้ถือหุ้นรายใหญ่"
+    # ใช้ไฟล์ในคอลัมน์ "ไฟล์ข้อมูล" ของบรรทัดที่ 4
     # ลำดับ:
-    #   1. ไฟล์ที่ submitList ระบุในหมวด "ผู้ถือหุ้นรายใหญ่"
-    #   2. ถ้าไม่มี → ค้น keyword "ผู้ถือหุ้น" / "shareholder" / "บอจ5"
+    #   1. ไฟล์ที่ submitList ระบุ (row 4)
+    #   2. ถ้าไม่มี → fallback ค้น keyword "ผู้ถือหุ้น" / "shareholder" / "บอจ5"
+    # ทั้งสองทาง: คำนวณคนที่ถือ > 25% จากจำนวนหุ้น
     sh_path = None
     sh_source = ""
-    for fname in sl_get_files(sl, "shareholder_doc"):
+    for fname in sl_get_files(sl, "shareholder_doc"):  # ← submitList row 4
         p = find_by_original(vf, fname)
         if p:
             sh_path = p
