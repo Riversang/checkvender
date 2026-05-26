@@ -92,7 +92,7 @@ class VendorData:
     mit: str = DASH
     catalogue: str = DASH
     work_cert: str = DASH       # หนังสือรับรองผลงาน
-    line_license: str = DASH    # Certificate/License (LINE)
+    line_license: str = DASH    # Certificate/License (generic — LINE/AWS/Microsoft/etc.)
     personnel: str = DASH       # บุคลากรหลัก (สำคัญใน MA)
     project_mgmt: str = DASH    # แผน/โครงสร้างการบริหารโครงการ (MA)
     other1: str = ""

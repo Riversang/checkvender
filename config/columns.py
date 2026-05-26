@@ -16,7 +16,7 @@ PART2_COLUMNS = {
     "mit":          "Made in\nThailand",
     "catalogue":    "แคตตาล็อก/\nคุณลักษณะเฉพาะ",
     "work_cert":    "หนังสือรับรอง\nผลงาน",
-    "line_license": "หนังสือรับรอง\nCertificate/\nLicense (LINE)",
+    "line_license": "หนังสือรับรอง\nCertificate/\nLicense",
     "other1":       "อื่นๆ",
     "other2":       "อื่นๆ",
     "note":         "หมายเหตุ",

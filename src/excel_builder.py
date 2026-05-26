@@ -118,7 +118,7 @@ _HEADERS_2 = [
     "SMEs", "Made in\nThailand",
     "แคตตาล็อก/\nคุณลักษณะเฉพาะ",
     "หนังสือรับรอง\nผลงาน",                         # H
-    "หนังสือรับรอง\nCertificate/\nLicense (LINE)",  # I (e-bidding ซื้อ)
+    "หนังสือรับรอง\nCertificate/\nLicense",          # I (generic — รองรับทุก project)
     "บุคลากร",                                       # J (MA / จ้าง)
     "แผน/โครงสร้าง\nการบริหาร",                     # K (MA / จ้าง)
     "หมายเหตุ",
