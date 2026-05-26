@@ -225,15 +225,14 @@ def _preprocess_for_ocr(img):
       1. grayscale (ลดสีรบกวน)
       2. autocontrast (ดันความต่างขาว-ดำให้ชัด)
       3. sharpen (เน้นเส้นขอบ — ช่วย Tesseract แยก vowel/tone marks)
-      4. binarize (threshold 180 — สีเทาเป็นขาว/ดำชัดเจน)
     คืน PIL.Image ที่ preprocess แล้ว
+
+    หมายเหตุ: ทดลอง binarize threshold แล้วลบออก เพราะ ตัวอักษรเทา/จาง
+    บางเอกสาร (เช่น Data First page 2) ถูก erase หาย → OCR ได้ไม่ครบ
     """
     img = img.convert("L")
     img = ImageOps.autocontrast(img, cutoff=2)
     img = img.filter(ImageFilter.SHARPEN)
-    # binarize: pixel > 180 → ขาว, อื่นๆ → ดำ
-    # ตัวอักษรที่จาง/blur จะถูก enhance ให้ชัดขึ้น
-    img = img.point(lambda x: 255 if x > 180 else 0, mode="1")
     return img
 
 

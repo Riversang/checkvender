@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from typing import Optional
 
 from .extractor import VendorFiles, find_file, find_files, list_files, find_by_original
@@ -249,6 +250,47 @@ _NOT_PERSON_WORDS = {
 }
 
 
+def _name_key(name: str) -> str:
+    """normalize ชื่อสำหรับ compare: ตัด title + space + dot + ส่วนที่ติด"""
+    if not name:
+        return ""
+    # ตัด title (รวม "น..", "น.ส", ฯลฯ)
+    n = re.sub(r"^(?:นางสาว|น\.ส?\.?|นาย|นาง|Mr\.?|Mrs\.?|Miss)\s*", "", name)
+    # ตัด space / dot / dash / parens
+    return re.sub(r"[\s\.\-\(\)\[\]]", "", n)
+
+
+def _predict_name(ocr_name: str, references: list[str],
+                  threshold: float = 0.55) -> tuple[str, float]:
+    """
+    คาดคะเนชื่อจริงจาก OCR text โดยเทียบกับ reference list (เช่น directors)
+
+    เช่น OCR ได้ "นางสาวยงยุทธศายลำเพาะ" + refs=["น.ส.ยงยุทธ สายลำเพาะ"]
+    → คืน ("น.ส.ยงยุทธ สายลำเพาะ", 0.85)
+
+    Returns:
+        (best_match, score) — ถ้า score < threshold คืน ocr_name เดิม
+    """
+    if not references:
+        return ocr_name, 0.0
+    ocr_key = _name_key(ocr_name)
+    if not ocr_key:
+        return ocr_name, 0.0
+    best_ref = ocr_name
+    best_score = 0.0
+    for ref in references:
+        ref_key = _name_key(ref)
+        if not ref_key:
+            continue
+        score = SequenceMatcher(None, ocr_key, ref_key).ratio()
+        if score > best_score:
+            best_score = score
+            best_ref = ref
+    if best_score >= threshold:
+        return best_ref, best_score
+    return ocr_name, best_score
+
+
 def _is_real_name(name: str) -> bool:
     """ตรวจว่า 'นายXXX' เป็นชื่อคนจริง (ไม่ใช่คำว่า นายหน้า, นายทะเบียน, นายจ้าง ฯลฯ)"""
     if not name or len(name) < 5:
@@ -281,7 +323,8 @@ def _is_real_name(name: str) -> bool:
 
 def _extract_authority(vf: VendorFiles,
                        sl_authority_files: list[str] = None,
-                       unread: list = None) -> str:
+                       unread: list = None,
+                       directors: list[str] = None) -> str:
     """
     ดึงรายชื่อผู้มีอำนาจควบคุมจากไฟล์ที่ submitList ระบุไว้เท่านั้น
 
@@ -297,6 +340,11 @@ def _extract_authority(vf: VendorFiles,
       - ไม่ใช้ directors เป็น fallback (กรรมการ ≠ ผู้มีอำนาจควบคุม)
       - ถ้าไม่มีไฟล์ใน submitList → "-"
       - ถ้ามีไฟล์แต่อ่านไม่ออก → "-" (มี warning ในหมายเหตุให้ user OCR เอง)
+
+    Name prediction:
+      - หลัง extract ชื่อจาก OCR ที่อาจเพี้ยน → fuzzy-match กับ `directors`
+      - ถ้า similarity ≥ 0.55 → แทนด้วยชื่อสะอาดจาก directors list
+      - ใช้แค่เป็น text cleanup — ไม่กระทบการตัดสิน ✓/-
     """
     # Fallback: ถ้า submitList ไม่มี → scan ไฟล์ใน ZIP ที่ชื่อมี "ผู้มีอำนาจ"/"ควบคุม"
     files_to_check = list(sl_authority_files or [])
@@ -323,7 +371,6 @@ def _extract_authority(vf: VendorFiles,
         t = _read(p, unread=unread, label="ผู้มีอำนาจควบคุม")
         if not t:
             continue
-        file_was_read = True
         # ดึงเฉพาะ section "ผู้มีอำนาจควบคุม" — หยุดที่ section อื่น
         # (กันไฟล์ที่รวม "ผู้มีอำนาจลงนาม" / "กรรมการ" / "ผู้ถือหุ้น" ไว้ด้วยกัน)
         block = t
@@ -365,6 +412,12 @@ def _extract_authority(vf: VendorFiles,
             )[0].strip()
             name = re.split(r"(?:หรือ|และ)" + _TITLE_ALT, name, maxsplit=1)[0].strip()
             name = re.sub(r"\s+[ก-๛]{1}\.?$", "", name).strip()
+            # ── คาดคะเนชื่อ: ถ้า fuzzy-match กับ directors ผ่าน threshold
+            #    → ใช้ชื่อสะอาดจาก directors แทน OCR ที่อาจเพี้ยน
+            if directors:
+                predicted, score = _predict_name(name, directors)
+                if score >= 0.55:
+                    name = predicted
             # normalize spaces ก่อนเช็ค dup (เผื่อ PDF artifact "นายอภิศักด ิ์")
             norm = re.sub(r"\s+", "", name)
             if _is_real_name(name) and norm not in {re.sub(r"\s+", "", x) for x in names}:
@@ -661,11 +714,15 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
         d.name = _extract_name_from_zip(vf.source_zip)
 
     # authority — ใช้เฉพาะไฟล์จาก submitList หมวด "ผู้มีอำนาจควบคุม"
-    # (ไม่ใช้ directors, ไม่ใช้ "กรรมการลงชื่อผูกพัน" — คนละหมวด)
+    # (ไม่ใช้ directors เป็น fallback — คนละหมวด)
+    # แต่ส่ง directors เข้าไปเพื่อใช้ "คาดคะเน" ชื่อจาก OCR ที่เพี้ยน
+    # (เช่น OCR ได้ "นางสาวยงยุทธศายลำเพาะ" → fuzzy match กับ directors
+    #  ["น.ส.ยงยุทธ สายลำเพาะ"] → แทนด้วยชื่อสะอาด)
     d.authority = _extract_authority(
         vf,
         sl_authority_files=sl_get_files(sl, "authority_doc"),
         unread=d.unread_files,
+        directors=d.directors,
     )
 
     # ── 2. ผู้ถือหุ้น >25% ──────────────────────────────────────────────────
