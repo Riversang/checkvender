@@ -389,6 +389,41 @@ def read_pdf_tables(path: str) -> list:
         return []
 
 
+def force_ocr_pdf(path: str, dpi: int = 900) -> str:
+    """
+    Force-OCR — ใช้ Tesseract กับ DPI สูง (zoom) สำหรับไฟล์ที่อ่านยาก
+    เช่น บอจ.5 ที่ฝัง font ปิด, ตารางเล็ก, ตัวเลข share range ละเอียด
+
+    ใช้กรณี text-based extraction อ่านได้แต่ "ขาดข้อมูล"
+    (เช่น เจอแต่ header วน loop, ไม่เห็นแถวผู้ถือหุ้น)
+    """
+    if not (_HAS_TESSERACT and _HAS_PYMUPDF):
+        return ""
+    if not _ensure_tesseract():
+        return ""
+    try:
+        doc = pymupdf.open(path)
+        n_pages = min(len(doc), TESSERACT_MAX_PAGES)
+        texts: list[str] = []
+        for i in range(n_pages):
+            page = doc[i]
+            pix = page.get_pixmap(dpi=dpi)
+            img_bytes = pix.tobytes("png")
+            from io import BytesIO
+            img = Image.open(BytesIO(img_bytes))
+            img = _preprocess_for_ocr(img)
+            t = _best_ocr(img, lang=TESSERACT_LANG)
+            if not t.strip():
+                t = _best_ocr(img, lang="eng")
+            t = _post_ocr_thai(t)
+            texts.append(t)
+        doc.close()
+        return "\n".join(texts).strip()
+    except Exception as e:
+        print(f"    [force_ocr error: {e}]")
+        return ""
+
+
 def read_pdf_text(path: str, use_vision: bool = True) -> tuple[str, bool]:
     """
     อ่าน PDF แบบหลายชั้น คืน (text, is_good_quality)
@@ -502,6 +537,104 @@ def _find_total_shares(text: str) -> Optional[int]:
     return None
 
 
+_BOJ5_HOLDER_LINE = re.compile(
+    # ดึง pattern: <name> ... <start>-<end>  (DBD บอจ.5 + OCR)
+    # ชื่อขึ้นต้นด้วย บจ./บมจ./นาย/นาง/น.ส./นางสาว/หจก./บริษัท
+    # name: greedy up to terminator (หุ้นละ / (ต่อ) / | / digits / newline)
+    r"((?:บจ\.|บมจ\.|หจก\.|บริษัท|หห?ส\.|นาย|นาง|น\.ส?\.?|นางสาว|Mr\.?|Mrs\.?)"
+    r"(?:(?!หุ้นละ|\(ต่อ\)|[\|\n]|\s\d{2,}|\s{3,})[^\n\|])*)"
+    # separator: combinations of (ต่อ), หุ้นละ, |, spaces, etc.
+    r"(?:\s*\(?(?:ต่อ)?\)?\s*หุ้นละ\s*|\s*หุ้นละ\s*\(?(?:ต่อ)?\)?\s*|\s*\(?(?:ต่อ)?\)?\s*)"
+    r"\|?\s*"
+    r"(\d{2,8})\s*[-—–]\s*(\d{2,8})"
+)
+
+
+def _aggregate_share_ranges(text: str, total: int,
+                            threshold: float = 25.0) -> list[tuple[str, float]]:
+    """
+    Parse DBD บอจ.5 style — แต่ละ holder มีหลายบรรทัดของ share number ranges
+    รวม shares per holder แล้วคำนวณ %
+
+    เช่น:
+      บจ.ซีทีไอ ไนซ์ โฮลดิ้ง  0999991-1000000
+      บจ.ซีทีไอ ไนซ์ โฮลดิ้ง  1000001-1183326
+      บจ.ซีทีไอ ไนซ์ โฮลดิ้ง  1183327-1333320
+      บจ.มิลเลเนียมฟอลคอน    1999991-2000000
+
+    → รวม "บจ.ซีทีไอ ไนซ์ โฮลดิ้ง" = 333,330 shares
+       (ถ้าทุน 2,000,000 = 16.67% — ต่ำกว่า 25%)
+    """
+    if total <= 0:
+        return []
+    holder_shares: dict[str, int] = {}
+    for m in _BOJ5_HOLDER_LINE.finditer(text):
+        name = re.sub(r"\s+", " ", m.group(1)).strip(" .,;:|()")
+        # ตัด "หุ้นละ" หรือ "(ต่อ)" ติดท้าย
+        name = re.sub(r"\s*(?:หุ้นละ|\(ต่อ\)|\(continued\)).*$", "", name).strip()
+        # ตัด trailing digits/code (เช่น tax_id ติดท้าย)
+        name = re.sub(r"\s+\d{8,}.*$", "", name).strip()
+        if len(name) < 4 or len(name) > 80:
+            continue
+        try:
+            start = int(m.group(2))
+            end = int(m.group(3))
+        except ValueError:
+            continue
+        if end < start or (end - start) > total:
+            continue
+        shares = end - start + 1
+        if 0 < shares <= total:
+            holder_shares[name] = holder_shares.get(name, 0) + shares
+    # filter > threshold%
+    results: list[tuple[str, float]] = []
+    for name, shares in holder_shares.items():
+        pct = shares * 100.0 / total
+        if pct > threshold:
+            results.append((name, round(pct, 2)))
+    # sort by % desc
+    results.sort(key=lambda x: -x[1])
+    return results
+
+
+def _aggregate_share_ranges_no_total(
+    text: str, threshold: float = 25.0
+) -> list[tuple[str, float]]:
+    """
+    Fallback: รวม share-ranges โดยไม่รู้ total
+    ใช้ผลรวมของทุก range เป็น proxy ของ total
+    (ใช้กรณี OCR อ่าน "แบ่งออกเป็น ... หุ้น" ไม่ออก)
+    """
+    holder_shares: dict[str, int] = {}
+    for m in _BOJ5_HOLDER_LINE.finditer(text):
+        name = re.sub(r"\s+", " ", m.group(1)).strip(" .,;:|()")
+        name = re.sub(r"\s*(?:หุ้นละ|\(ต่อ\)|\(continued\)).*$", "", name).strip()
+        name = re.sub(r"\s+\d{8,}.*$", "", name).strip()
+        if len(name) < 4 or len(name) > 80:
+            continue
+        try:
+            start = int(m.group(2))
+            end = int(m.group(3))
+        except ValueError:
+            continue
+        if end < start or (end - start) > 100_000_000:
+            continue
+        shares = end - start + 1
+        holder_shares[name] = holder_shares.get(name, 0) + shares
+    if not holder_shares:
+        return []
+    total_proxy = sum(holder_shares.values())
+    if total_proxy <= 0:
+        return []
+    results: list[tuple[str, float]] = []
+    for name, shares in holder_shares.items():
+        pct = shares * 100.0 / total_proxy
+        if pct > threshold:
+            results.append((name, round(pct, 2)))
+    results.sort(key=lambda x: -x[1])
+    return results
+
+
 def find_shareholder_over(
     text: str,
     threshold: float = 25.0,
@@ -534,7 +667,18 @@ def find_shareholder_over(
     # ── strategy 2: คำนวณจาก จำนวนหุ้น / total ────────────────────────────────
     total = _find_total_shares(text)
     if not total or total <= 0:
+        # ลอง aggregate ranges แม้ไม่มี total (ใช้ผลรวมเป็น proxy)
+        agg = _aggregate_share_ranges_no_total(text, threshold)
+        if agg:
+            return agg
         return results
+
+    # ── strategy 2.5: aggregate share-number ranges (DBD บอจ.5 multi-line) ──
+    # ★ สำคัญ: ผู้ถือหุ้นเดียวกันอาจปรากฏหลายบรรทัด (เช่น "บจ.X (ต่อ) 6085001-6417500"
+    #   และ "บจ.X (ต่อ) 8610001-9180000") — ต้องรวม shares แล้วคำนวณ % รวม
+    agg = _aggregate_share_ranges(text, total, threshold)
+    if agg:
+        return agg
 
     # parse tables ถ้ามี
     if tables:

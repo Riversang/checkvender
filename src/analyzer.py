@@ -43,6 +43,7 @@ from .pdf_reader import (
     extract_net_worth,
     find_shareholder_over,
     extract_thai_number,
+    force_ocr_pdf,
 )
 from .submitlist_parser import (
     parse_submitlist,
@@ -133,6 +134,79 @@ def _read_tables(path: Optional[str]) -> list:
 def _norm(s: str) -> str:
     """normalize: lower, ตัด space"""
     return re.sub(r"\s+", "", (s or "").lower())
+
+
+# ─── Thai date parsing (สำหรับเลือกไฟล์ใหม่ที่สุด) ─────────────────────────────
+
+import datetime as _dt
+
+_THAI_MONTHS = {
+    "มกราคม": 1, "กุมภาพันธ์": 2, "มีนาคม": 3, "เมษายน": 4,
+    "พฤษภาคม": 5, "มิถุนายน": 6, "กรกฎาคม": 7, "สิงหาคม": 8,
+    "กันยายน": 9, "ตุลาคม": 10, "พฤศจิกายน": 11, "ธันวาคม": 12,
+    # short forms (no dot)
+    "ม.ค.": 1, "ก.พ.": 2, "มี.ค.": 3, "เม.ย.": 4,
+    "พ.ค.": 5, "มิ.ย.": 6, "ก.ค.": 7, "ส.ค.": 8,
+    "ก.ย.": 9, "ต.ค.": 10, "พ.ย.": 11, "ธ.ค.": 12,
+}
+
+
+def _normalize_year(y: int) -> int:
+    """แปลง ปี พ.ศ. → ค.ศ. (ถ้า > 2400 ถือว่าเป็น พ.ศ.)"""
+    return y - 543 if y > 2400 else y
+
+
+def _extract_latest_date(text: str) -> Optional[_dt.date]:
+    """หาวันที่ล่าสุดในข้อความ (รองรับทั้ง DD/MM/YYYY และ DD เดือนไทย YYYY)"""
+    if not text:
+        return None
+    dates: list[_dt.date] = []
+    # Pattern 1: DD/MM/YYYY
+    for m in re.finditer(r"(\d{1,2})/(\d{1,2})/(\d{4})", text):
+        try:
+            d = _dt.date(_normalize_year(int(m.group(3))),
+                          int(m.group(2)), int(m.group(1)))
+            if 2010 <= d.year <= 2100:   # range filter
+                dates.append(d)
+        except ValueError:
+            continue
+    # Pattern 2: DD <Thai month> YYYY  (เช่น "13 มกราคม 2569")
+    months_alt = "|".join(re.escape(m) for m in _THAI_MONTHS)
+    for m in re.finditer(rf"(\d{{1,2}})\s+({months_alt})\s+(\d{{4}})", text):
+        try:
+            d = _dt.date(_normalize_year(int(m.group(3))),
+                          _THAI_MONTHS[m.group(2)], int(m.group(1)))
+            if 2010 <= d.year <= 2100:
+                dates.append(d)
+        except ValueError:
+            continue
+    return max(dates) if dates else None
+
+
+def _pick_latest_file(vf: VendorFiles, fnames: list[str],
+                      label: str = "",
+                      unread: Optional[list] = None) -> Optional[str]:
+    """
+    ในกลุ่มไฟล์ที่ submitList ระบุไว้สำหรับหมวดเดียวกัน — เลือก path ที่ลง
+    "วันที่ออกเอกสาร" / "ข้อมูล ณ วันที่" ใหม่ที่สุด
+
+    Returns: path ของไฟล์ใหม่ที่สุด (หรือ first found ถ้าไม่มีวันที่)
+    """
+    if not fnames:
+        return None
+    candidates: list[tuple[Optional[_dt.date], str]] = []
+    for fn in fnames:
+        p = find_by_original(vf, fn)
+        if not p:
+            continue
+        text = _read(p, unread=unread, label=label)
+        d = _extract_latest_date(text)
+        candidates.append((d, p))
+    if not candidates:
+        return None
+    # เรียงโดย date desc (None ไปท้าย)
+    candidates.sort(key=lambda x: x[0] or _dt.date.min, reverse=True)
+    return candidates[0][1]
 
 
 # ─── company name ────────────────────────────────────────────────────────────
@@ -779,33 +853,52 @@ def analyze_vendor(vf: VendorFiles, vendor_no: int, budget: float = 0) -> Vendor
     # ใช้ไฟล์ในคอลัมน์ "ไฟล์ข้อมูล" ของบรรทัดที่ 4
     # ลำดับ:
     #   1. ไฟล์ที่ submitList ระบุ (row 4)
+    #      → เรียงตามวันที่ "ออกเอกสาร / ข้อมูล ณ" ใหม่สุดก่อน
+    #      → ลองไฟล์ใหม่สุดก่อน; ถ้า extract ไม่ได้ ค่อยลองไฟล์เก่ากว่า
     #   2. ถ้าไม่มี → fallback ค้น keyword "ผู้ถือหุ้น" / "shareholder" / "บอจ5"
-    # ทั้งสองทาง: คำนวณคนที่ถือ > 25% จากจำนวนหุ้น
-    sh_path = None
-    sh_source = ""
-    for fname in sl_get_files(sl, "shareholder_doc"):  # ← submitList row 4
-        p = find_by_original(vf, fname)
-        if p:
-            sh_path = p
-            sh_source = "สารบัญ submitList"
-            break
-    if not sh_path:
-        # fallback: ค้น keyword ในไฟล์
+    has_major_holder = False
+    holders: list = []
+    sl_sh_files = sl_get_files(sl, "shareholder_doc")  # ← submitList row 4
+    # สร้าง list (date, path) เรียงใหม่ก่อน
+    sh_candidates: list[tuple[Optional[_dt.date], str]] = []
+    if sl_sh_files:
+        for fn in sl_sh_files:
+            p = find_by_original(vf, fn)
+            if not p:
+                continue
+            text_tmp = _read(p, unread=d.unread_files, label="ผู้ถือหุ้น")
+            sh_candidates.append((_extract_latest_date(text_tmp), p))
+    # fallback: ค้น keyword
+    if not sh_candidates:
         for kw in ("ผู้ถือหุ้น", "shareholder", "บอจ5", "บอจ.5"):
-            sh_path = find_file(vf, kw)
-            if sh_path:
-                sh_source = f"ค้นจาก keyword '{kw}'"
+            p = find_file(vf, kw)
+            if p:
+                sh_candidates.append((None, p))
                 break
-
-    has_major_holder = False   # ใช้ตัดสิน ✓/- ใน Section 1 col "ผู้ถือหุ้นรายใหญ่"
-    if sh_path:
-        sh_text = _read(sh_path, unread=d.unread_files, label="ผู้ถือหุ้น")
-        sh_tables = _read_tables(sh_path)
-        holders = find_shareholder_over(sh_text, threshold=25.0, tables=sh_tables)
-        if holders:
-            has_major_holder = True
-            # แสดงแค่ "ชื่อ (%)" ไม่ใส่ source suffix (per user)
-            d.shareholders = "\n".join(f"{n} ({p:.2f}%)" for n, p in holders)
+    # เรียงใหม่ก่อน (None ไปท้าย) แล้วลองทีละไฟล์
+    sh_candidates.sort(key=lambda x: x[0] or _dt.date.min, reverse=True)
+    for _date, p in sh_candidates:
+        sh_text = _read(p, unread=d.unread_files, label="ผู้ถือหุ้น")
+        sh_tables = _read_tables(p)
+        h = find_shareholder_over(sh_text, threshold=25.0, tables=sh_tables)
+        # ★ ถ้า text-based ไม่เจอ → force OCR (zoom DPI สูง)
+        # เหตุผล: บอจ.5 บางฉบับฝัง font ปิด ทำให้ pdfplumber อ่านได้แต่ header
+        # วน loop ไม่เห็นแถวจริง — ต้อง render เป็นภาพแล้ว OCR
+        if not h:
+            ocr_text = force_ocr_pdf(p, dpi=900)
+            if ocr_text:
+                h = find_shareholder_over(ocr_text, threshold=25.0, tables=None)
+                if h:
+                    # อ่านได้แล้ว — ลบ entry จาก unread_files
+                    base = os.path.basename(p)
+                    d.unread_files = [u for u in d.unread_files
+                                      if not u.endswith(base)]
+        if h:
+            holders = h
+            break  # ใช้ไฟล์ใหม่สุดที่ extract ได้
+    if holders:
+        has_major_holder = True
+        d.shareholders = "\n".join(f"{n} ({p:.2f}%)" for n, p in holders)
 
     # ── 3. มูลค่าสุทธิ ──────────────────────────────────────────────────────
     fin_path = None
